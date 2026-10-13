@@ -30,7 +30,7 @@ let project = Project(
       // narrow iPadOS windows must resolve to the compact (stack) layout.
       destinations: [.iPhone, .iPad],
       product: .app,
-      bundleId: "me.honcharenko.HermesMobile",
+      bundleId: "com.taquitos.HermesMobile",
       deploymentTargets: .iOS("18.0"),
       infoPlist: .extendingDefault(with: [
         // Wire the bundle version/short-version to the build settings below so a
@@ -117,7 +117,7 @@ let project = Project(
       name: "HermesMobileTests",
       destinations: [.iPhone, .iPad],
       product: .unitTests,
-      bundleId: "me.honcharenko.HermesMobileTests",
+      bundleId: "com.taquitos.HermesMobileTests",
       deploymentTargets: .iOS("18.0"),
       sources: ["HermesMobileTests/**"],
       dependencies: [

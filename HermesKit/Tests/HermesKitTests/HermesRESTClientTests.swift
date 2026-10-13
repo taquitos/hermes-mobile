@@ -787,13 +787,52 @@ struct HermesRESTClientTests {
   }
 
   @Test func sendTestPushPostsToTestRoute() async throws {
-    MockURLProtocol.set(status: 200)
+    MockURLProtocol.set(json: #"{"ok":true,"devices":1,"results":[{"delivered":true,"status":200}]}"#)
     try await makeClient().sendTestPush(connection)
 
     let req = try #require(MockURLProtocol.lastRequest)
     #expect(req.httpMethod == "POST")
     #expect(req.url?.path == "/api/plugins/hermes-push/test")
     #expect(req.value(forHTTPHeaderField: "X-Hermes-Session-Token") == "tok")
+  }
+
+  @Test func sendTestPushRejectsZeroRegisteredDevices() async throws {
+    MockURLProtocol.set(json: #"{"ok":true,"devices":0,"results":[]}"#)
+    await #expect(throws: PushDeliveryError.noDevices) {
+      try await makeClient().sendTestPush(connection)
+    }
+  }
+
+  @Test func sendTestPushSurfacesAPNsRejectionDespiteHTTP200() async throws {
+    MockURLProtocol.set(json: #"{"ok":true,"devices":1,"results":[{"delivered":false,"status":400,"error":"DeviceTokenNotForTopic","device":"masked-token"}]}"#)
+    await #expect(throws: PushDeliveryError.rejected(status: 400, reason: "DeviceTokenNotForTopic")) {
+      try await makeClient().sendTestPush(connection)
+    }
+  }
+
+  @Test func sendTestPushSurfacesGatewayFailureDespiteHTTP200() async throws {
+    MockURLProtocol.set(json: #"{"ok":true,"devices":1,"results":[{"delivered":false,"status":502,"error":"gateway_status_502","pruned":false}]}"#)
+    await #expect(throws: PushDeliveryError.rejected(status: 502, reason: "gateway_status_502")) {
+      try await makeClient().sendTestPush(connection)
+    }
+  }
+
+  @Test func sendTestPushAcceptsOneSuccessAmongFailedDevices() async throws {
+    MockURLProtocol.set(json: #"{"ok":true,"devices":2,"results":[{"delivered":false,"status":410,"error":"pruned_410","pruned":true},{"delivered":true,"status":200}]}"#)
+    try await makeClient().sendTestPush(connection)
+  }
+
+  @Test(arguments: [
+    "not-json", "{}", #"{"ok":true,"devices":1}"#,
+    #"{"ok":true,"devices":1,"results":[]}"#,
+    #"{"ok":true,"devices":1,"results":[{"status":200}]}"#,
+    #"{"ok":false,"devices":1,"results":[{"delivered":true,"status":200}]}"#,
+  ])
+  func sendTestPushRequiresConfirmedDelivery(json: String) async throws {
+    MockURLProtocol.set(json: json)
+    await #expect(throws: PushDeliveryError.unconfirmed) {
+      try await makeClient().sendTestPush(connection)
+    }
   }
 
   @Test func sendTestPushNotFoundSurfacesCapabilityGate() async throws {

@@ -138,8 +138,8 @@ struct SettingsView: View {
           case .sent:
             Label("Test notification sent", systemImage: "checkmark.circle")
               .foregroundStyle(.green).font(.footnote)
-          case .failed:
-            Label("Couldn't send test notification", systemImage: "exclamationmark.triangle")
+          case let .failed(message):
+            Label(message, systemImage: "exclamationmark.triangle")
               .foregroundStyle(.orange).font(.footnote)
           }
           Button("How push notifications work") { showingPushGuide = true }

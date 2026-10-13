@@ -451,7 +451,15 @@ public extension HermesRESTClient {
         let url = try makeURL(conn.baseURL, "/api/plugins/hermes-push/test")
         // No body needed — the plugin looks up the caller's registered device(s).
         // 404 → `RESTError.notFound` (plugin not installed); the caller capability-gates.
-        try await send(url, method: "POST", body: Data("{}".utf8), auth: authFor(conn), session: session)
+        let response: TestPushResponse
+        do {
+          response = try await postJSON(
+            url, body: Data("{}".utf8), auth: authFor(conn), session: session
+          )
+        } catch RESTError.decoding {
+          throw PushDeliveryError.unconfirmed
+        }
+        try response.validateDelivery()
       },
       cronJobs: { conn, profile in
         // `nil` profile omits the param entirely — the server then aggregates all profiles
@@ -813,6 +821,28 @@ func send(
 }
 
 // MARK: - DTOs (verified against hermes_cli/web_server.py + hermes_state.py)
+
+private struct TestPushResponse: Decodable {
+  let ok: Bool?
+  let devices: Int
+  let results: [DeliveryResult]
+
+  struct DeliveryResult: Decodable {
+    let delivered: Bool
+    let status: Int?
+    let error: String?
+  }
+
+  func validateDelivery() throws {
+    guard ok != false, devices >= 0 else { throw PushDeliveryError.unconfirmed }
+    guard devices > 0 else { throw PushDeliveryError.noDevices }
+    guard !results.isEmpty else { throw PushDeliveryError.unconfirmed }
+    // Other registered devices can be offline or stale; one accepted delivery succeeds.
+    guard !results.contains(where: \.delivered) else { return }
+    let failure = results.first(where: { $0.error != nil || $0.status != nil }) ?? results[0]
+    throw PushDeliveryError.rejected(status: failure.status, reason: failure.error)
+  }
+}
 
 private struct SessionsResponse: Decodable {
   let sessions: [SessionListDTO]

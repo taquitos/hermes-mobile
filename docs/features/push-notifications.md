@@ -26,6 +26,10 @@ Push notifications span THREE artifacts but only the iOS app lives in this repo:
   `development` would ship a sandbox entitlement on Release).
 - **Permission is requested on the sessions-list appearance** (right after login), per the
   product decision — NOT first launch.
+- **Test delivery requires a positive result** from `POST /api/plugins/hermes-push/test`.
+  HTTP 200 alone is not success: no registered devices, missing delivery results, or a failure
+  for every device displays an error in Settings. One accepted device is enough when other
+  registered devices fail. Acceptance does not prove that iOS displayed the notification.
 - **`PushClient` is iOS-only-guarded** like `AudioRecorderClient` (`#if canImport(UIKit)`;
   non-iOS `liveValue = testValue`); keep pure logic (hex, `apnsEnv`, payload parse,
   foreground-suppression) — and `PushBridge` itself (Foundation-only: `NSLock` + `AsyncStream`)

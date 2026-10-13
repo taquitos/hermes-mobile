@@ -68,6 +68,30 @@ public enum PushPluginStatus: Equatable, Sendable {
   case unknown
 }
 
+/// A test request reached the plugin, but delivery was not confirmed.
+public enum PushDeliveryError: Error, Equatable, Sendable {
+  case noDevices
+  case unconfirmed
+  case rejected(status: Int?, reason: String?)
+
+  public var message: String {
+    switch self {
+    case .noDevices:
+      "No devices are registered for notifications."
+    case .unconfirmed:
+      "The server didn't confirm notification delivery."
+    case let .rejected(status, reason):
+      if let reason = reason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+        "Push delivery failed: \(reason)"
+      } else if let status {
+        "Push delivery failed (HTTP \(status))."
+      } else {
+        "The push service didn't accept the notification."
+      }
+    }
+  }
+}
+
 /// What the plugin hub tells us about the installed `hermes-push` plugin: its readiness, the
 /// version it reports from its own manifest, and whether the agent can `git pull` it in place.
 ///

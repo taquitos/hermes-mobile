@@ -49,7 +49,7 @@ public struct SettingsFeature {
       case idle
       case sending
       case sent
-      case failed
+      case failed(String)
     }
 
     /// State of the in-app "update the plugin" action.
@@ -133,7 +133,7 @@ public struct SettingsFeature {
     /// User tapped "Send test notification".
     case sendTestPushTapped
     /// Result of the test-push request.
-    case testPushResult(Bool)
+    case testPushResult(TestPushOutcome)
     /// The push guide's "Ask agent to install" button — dismiss Settings and bubble up so the
     /// app opens a new chat with the install prompt pre-filled.
     case askAgentToInstallTapped
@@ -146,6 +146,12 @@ public struct SettingsFeature {
     /// User picked a different default swipe action for session rows.
     case defaultSwipeActionChanged(SessionSwipeAction)
     case delegate(Delegate)
+
+    @CasePathable
+    public enum TestPushOutcome: Equatable, Sendable {
+      case sent
+      case failed(String)
+    }
 
     /// Result of the in-app plugin update, flattened to an `Equatable` shape (the failure
     /// carries the server's message rather than the error value, matching `testPushResult`).
@@ -292,19 +298,26 @@ public struct SettingsFeature {
             rest: rest, push: push, preferences: preferences,
             connection: connection, clock: clock
           ) else {
-            await send(.testPushResult(false))
+            await send(.testPushResult(.failed("Couldn't register for notifications.")))
             return
           }
           do {
             try await rest.sendTestPush(connection)
-            await send(.testPushResult(true))
+            await send(.testPushResult(.sent))
+          } catch let error as PushDeliveryError {
+            await send(.testPushResult(.failed(error.message)))
+          } catch let error as RESTError {
+            await send(.testPushResult(.failed(error.message)))
           } catch {
-            await send(.testPushResult(false))
+            await send(.testPushResult(.failed("Couldn't send test notification.")))
           }
         }
 
-      case let .testPushResult(ok):
-        state.testPushStatus = ok ? .sent : .failed
+      case let .testPushResult(outcome):
+        switch outcome {
+        case .sent: state.testPushStatus = .sent
+        case let .failed(message): state.testPushStatus = .failed(message)
+        }
         return .none
 
       case let .defaultSwipeActionChanged(action):

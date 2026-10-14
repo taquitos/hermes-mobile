@@ -24,6 +24,8 @@ struct MarkdownText: View {
         switch segment {
         case let .prose(value):
           prose(value)
+        case let .image(url, alt):
+          MarkdownImageView(url: url, alt: alt)
         case let .heading(level, value):
           heading(level: level, text: value)
         case let .blockquote(value):
@@ -122,6 +124,61 @@ struct MarkdownText: View {
       }
     }
     return nil
+  }
+}
+
+/// A standalone image segment (#image): renders inline over http(s) via `AsyncImage`,
+/// or decodes a `data:` URL (the shape the gateway substitutes for `MEDIA:` paths, which
+/// the phone can't read from the server's disk) into a `UIImage`. Falls back to the alt
+/// text / a small label when nothing loads, so a broken reference never collapses the row.
+struct MarkdownImageView: View {
+  let url: String
+  let alt: String
+
+  @State private var decoded: UIImage?
+  @Environment(\.openURL) private var openURL
+
+  var body: some View {
+    Group {
+      if let decoded {
+        Image(uiImage: decoded).resizable().scaledToFit()
+      } else if let remote = URL(string: url), url.hasPrefix("http") {
+        AsyncImage(url: remote) { phase in
+          switch phase {
+          case let .success(image): image.resizable().scaledToFit()
+          case .failure: fallback
+          case .empty: ProgressView()
+          @unknown default: fallback
+          }
+        }
+      } else {
+        fallback
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .clipShape(.rect(cornerRadius: 12))
+    .contentShape(.rect)
+    .onTapGesture { if let remote = URL(string: url), url.hasPrefix("http") { openURL(remote) } }
+    .task(id: url) { decoded = Self.decodeDataURL(url) }
+    .accessibilityLabel(alt.isEmpty ? "Image" : alt)
+  }
+
+  private var fallback: some View {
+    HStack(spacing: 6) {
+      Image(systemName: "photo")
+      Text(alt.isEmpty ? url : alt).font(.caption).lineLimit(1)
+    }
+    .foregroundStyle(.secondary)
+    .padding(8)
+    .background(Color(uiColor: .tertiarySystemBackground), in: .rect(cornerRadius: 8))
+  }
+
+  /// Decode a `data:image/...;base64,...` URL into an image; `nil` for non-data URLs.
+  static func decodeDataURL(_ raw: String) -> UIImage? {
+    guard raw.hasPrefix("data:"), let comma = raw.firstIndex(of: ",") else { return nil }
+    let b64 = String(raw[raw.index(after: comma)...])
+    guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else { return nil }
+    return UIImage(data: data)
   }
 }
 

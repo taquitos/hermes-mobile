@@ -243,4 +243,47 @@ struct MarkdownSegmentTests {
       .blockquote(text: "a quote"),
     ])
   }
+
+  @Test func markdownImageOnOwnLineIsAnImageSegment() {
+    let text = "before\n![a cat](https://x.test/cat.png)\nafter"
+    #expect(MarkdownSegment.parse(text) == [
+      .prose("before"),
+      .image(url: "https://x.test/cat.png", alt: "a cat"),
+      .prose("after"),
+    ])
+  }
+
+  @Test func bareMediaTagIsAnImageSegment() {
+    #expect(MarkdownSegment.parse("MEDIA:/tmp/a.png") == [.image(url: "/tmp/a.png", alt: "")])
+  }
+
+  @Test func mediaTagStripsWrappingQuotesAndBackticks() {
+    #expect(MarkdownSegment.parse("`MEDIA:/tmp/a.png`") == [.image(url: "/tmp/a.png", alt: "")])
+    #expect(MarkdownSegment.parse("\"MEDIA:/tmp/a.png\"") == [.image(url: "/tmp/a.png", alt: "")])
+  }
+
+  @Test func dataURLImageIsParsedWhole() {
+    let url = "data:image/png;base64,iVBORw0KGgo="
+    #expect(MarkdownSegment.parse("![image](\(url))") == [.image(url: url, alt: "image")])
+  }
+
+  @Test func inlineImageInsideProseStaysProse() {
+    // Only a WHOLE line is an image; an image mid-sentence stays prose.
+    #expect(MarkdownSegment.parse("see ![a](https://x.test/a.png) here") == [
+      .prose("see ![a](https://x.test/a.png) here"),
+    ])
+  }
+
+  @Test func bracketedLinkIsNotAnImage() {
+    #expect(MarkdownSegment.parse("[label](https://x.test/a.png)") == [
+      .prose("[label](https://x.test/a.png)"),
+    ])
+  }
+
+  @Test func imageInsideFenceStaysLiteral() {
+    let text = "```\n![a](https://x.test/a.png)\n```"
+    #expect(MarkdownSegment.parse(text) == [
+      .code(text: "![a](https://x.test/a.png)", language: nil),
+    ])
+  }
 }

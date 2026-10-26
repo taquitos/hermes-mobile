@@ -35,11 +35,12 @@ away from your desk and still keep your agent moving.
   retry screen naming the server instead of a sign-in form (it retries by itself when
   you foreground the app, right after you flip the VPN on); only a real rejection sends
   you back to sign-in.
-- **Find any session.** Browse sessions grouped by workspace, search across all of
-  them, pin the ones you care about, rename or archive them — or permanently delete
-  the ones you're done with, from the main list or the archived view (a Settings
-  option picks whether a full swipe archives or deletes) — and resume or start a
-  new one.
+- **Find any session.** Browse sessions as inbox-style cards (workspace, title, preview,
+  model, message count) sorted into Today / Yesterday / Last week… sections, search
+  across all of them, pin the ones you care about, rename or archive them — or
+  permanently delete the ones you're done with, from the main list or the archived
+  view (a Settings option picks whether a full swipe archives or deletes) — and
+  resume or start a new one. Cron-job runs get their own collapsible section.
 - **Switch profiles.** Keep multiple Hermes profiles on one agent and switch between
   them from a Safari-style header pill — each profile has its own scoped session list,
   and new chats are created under the selected one. Create custom profiles (with an
@@ -77,14 +78,24 @@ away from your desk and still keep your agent moving.
   without derailing the original conversation. Branches show nested under their parent
   in the session list, desktop-style.
 - **Approve from anywhere.** The mobile-native payoff: respond to approval, clarify,
-  and `sudo`/`secret` prompts the moment they arrive. Even if the app was offline when
-  an approval fired, tapping its push notification still surfaces an approve/deny card
-  (generic, since no command content ever transits the push gateway) — with honest
-  "already handled elsewhere" feedback if it was resolved on another client.
+  and `sudo`/`secret` prompts the moment they arrive. Clarify questions come in every
+  form the desktop app shows: pick one choice, tick several, type your own answer with
+  "Other", or work through a batch of up to five questions on one card (the agent's
+  recommended choice is marked, never preselected). When several prompts are waiting,
+  they queue and show one at a time. Lost the connection, or opened the app from a push
+  notification? The open prompts come back exactly as the agent asked them, with the
+  command or question in full (no content ever transits the push gateway). If you
+  answer something already handled on another client, the app says so. Works with
+  current Hermes releases, which send prompts as server requests, and with older agents
+  that still use the event-based prompts (there, a push tap brings back a generic
+  approve/deny card, and the newer clarify forms are not available).
 - **Stays connected.** Automatic reconnect with backoff and a clear connection banner
-  when the link drops. Reopening a session — after navigating away, backgrounding the app,
-  or a cold relaunch — restores its live state: the right model, context usage, full
-  tool/thinking history, and an in-progress turn that keeps streaming with its timer ticking.
+  when the link drops. On current Hermes releases a reconnect also catches up on what a
+  running turn did while you were offline: the tool calls and thinking from the gap show up
+  right away instead of when the turn ends. Reopening a session — after navigating away,
+  backgrounding the app, or a cold relaunch — restores its live state: the right model,
+  context usage, full tool/thinking history, and an in-progress turn that keeps streaming
+  with its timer ticking.
   A running turn even keeps its live connection while you browse the session list, and for a
   short grace window after backgrounding — falling back to reconnect-and-restore beyond that.
 - **Native on iPad.** In a wide window the session list sits in a sidebar next to the

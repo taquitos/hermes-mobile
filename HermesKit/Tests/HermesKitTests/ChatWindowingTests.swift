@@ -244,7 +244,7 @@ struct ChatWindowingTests {
       "session_id": .string("live123"),
       "stored_session_id": .string("stored123"),
       "messages": .array(messages.map {
-        .object(["id": .number(Double($0.id ?? 0)), "role": .string($0.role), "content": .string($0.content ?? "")])
+        .object(["id": .number(Double($0.id)), "role": .string($0.role), "content": .string($0.content ?? "")])
       }),
       "running": .bool(false),
     ])
@@ -272,7 +272,7 @@ struct ChatWindowingTests {
     let payload: JSONValue = .object([
       "session_id": .string("live123"),
       "messages": .array(messages.map {
-        .object(["id": .number(Double($0.id ?? 0)), "role": .string($0.role), "content": .string($0.content ?? "")])
+        .object(["id": .number(Double($0.id)), "role": .string($0.role), "content": .string($0.content ?? "")])
       }),
       "running": .bool(false),
     ])
@@ -306,7 +306,7 @@ struct ChatWindowingTests {
     let payload: JSONValue = .object([
       "session_id": .string("live123"),
       "messages": .array(messages.dropLast().map {
-        .object(["id": .number(Double($0.id ?? 0)), "role": .string($0.role), "content": .string($0.content ?? "")])
+        .object(["id": .number(Double($0.id)), "role": .string($0.role), "content": .string($0.content ?? "")])
       }),
       "running": .bool(false),
     ])

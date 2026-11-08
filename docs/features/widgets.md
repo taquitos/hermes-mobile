@@ -84,8 +84,8 @@ sees one module.
   extension can't be imported). That is why the row view is `SessionsWidgetRowView`: the app
   already has a `SessionRowView`.
 - **Targets** (`Project.swift`): the `HermesWidgets` `.appExtension`
-  (`me.honcharenko.HermesMobile.Widgets`, iOS 18, the `com.apple.widgetkit-extension` point) is
-  embedded in the app. Both targets carry the App Group `group.me.honcharenko.HermesMobile`
+  (`com.taquitos.HermesMobile.Widgets`, iOS 18, the `com.apple.widgetkit-extension` point) is
+  embedded in the app. Both targets carry the App Group `group.com.taquitos.HermesMobile`
   and share the `marketingVersion` / `currentProjectVersion` / `appGroupIdentifier` constants,
   so they can't drift. The app adds `NSSupportsLiveActivities = true` and the `hermesmobile`
   `CFBundleURLTypes` scheme. Signing: `docs/development.md`.

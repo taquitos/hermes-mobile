@@ -89,6 +89,14 @@ public struct ModelOptions: Equatable, Sendable, Decodable {
     /// come back authenticated=false with an empty model list and a `warning`.
     public var isConfigured: Bool { (authenticated ?? false) && !models.isEmpty }
 
+    /// Whether the model picker must drop this row entirely — see
+    /// `ModelOptions.hiddenProviderSlugs`. Applies to the picker list AND its search results
+    /// (both flow through `orderedProviders`); the payload itself is left untouched so
+    /// nothing else that reads `providers` (e.g. `supportsReasoning`) changes behaviour.
+    public var isHiddenFromPicker: Bool {
+      ModelOptions.isHiddenPickerProvider(slug: selectionSlug, name: name)
+    }
+
     enum CodingKeys: String, CodingKey {
       case name, slug, models, authenticated, warning, capabilities, aliases
     }
@@ -131,11 +139,39 @@ public struct ModelOptions: Equatable, Sendable, Decodable {
 
   /// Providers ordered for the picker: configured (selectable) first in server order,
   /// then unconfigured ones (shown disabled, with a configure hint). Providers that are
-  /// neither configured nor offer a hint are dropped.
+  /// neither configured nor offer a hint are dropped, as are the ones named in
+  /// `hiddenProviderSlugs` (the picker-only hide list below).
   public var orderedProviders: [Provider] {
-    let configured = providers.filter(\.isConfigured)
-    let unconfigured = providers.filter { !$0.isConfigured && ($0.warning?.isEmpty == false) }
+    let visible = providers.filter { !$0.isHiddenFromPicker }
+    let configured = visible.filter(\.isConfigured)
+    let unconfigured = visible.filter { !$0.isConfigured && ($0.warning?.isEmpty == false) }
     return configured + unconfigured
+  }
+
+  // MARK: Picker hide list
+
+  /// Provider SLUGS the model picker never shows, whatever the gateway publishes. The current
+  /// entries — Nous Portal (`nous`), GitHub Copilot (`copilot`) and GitHub Copilot ACP
+  /// (`copilot-acp`) — are rows the gateway publishes unconditionally with no mobile-side
+  /// toggle, so the hide is client-side. Desktop parity is deliberately broken here: this is a
+  /// fork-local preference.
+  public static let hiddenProviderSlugs: Set<String> = ["nous", "copilot", "copilot-acp"]
+
+  /// Fallback for the rare row with no slug: folded (case/diacritic-insensitive) display names
+  /// that identify the same providers. Exact match only, so a user-defined custom row named
+  /// e.g. "Nous Proxy" or "GitHub Copilot Enterprise" is NOT hidden.
+  public static let hiddenProviderDisplayNames: Set<String> = [
+    "nous", "nous portal", "github copilot", "github copilot acp",
+  ]
+
+  /// Slug-first hide test; falls back to the folded display name only when the row carries no
+  /// usable slug (blank/whitespace counts as absent, same rule as `selectionSlug`).
+  static func isHiddenPickerProvider(slug: String?, name: String) -> Bool {
+    let normalizedSlug = (slug ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !normalizedSlug.isEmpty {
+      return hiddenProviderSlugs.contains(normalizedSlug.lowercased())
+    }
+    return hiddenProviderDisplayNames.contains(normalizedForSearch(name))
   }
 
   /// Filters `orderedProviders` against a free-text query while preserving the picker's

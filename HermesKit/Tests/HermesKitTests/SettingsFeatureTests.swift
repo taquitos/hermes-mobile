@@ -575,7 +575,34 @@ struct SettingsFeatureTests {
     }
     push.emit(token: "tok-1")
     await store.receive(\.testPushResult) {
-      $0.testPushStatus = .failed
+      $0.testPushStatus = .failed(RESTError.notFound.message)
+    }
+  }
+
+  @Test(arguments: [
+    PushDeliveryError.noDevices,
+    .unconfirmed,
+    .rejected(status: 400, reason: "DeviceTokenNotForTopic"),
+    .rejected(status: 502, reason: "gateway_status_502"),
+  ])
+  func sendTestPushDisplaysDeliveryFailure(error: PushDeliveryError) async {
+    let push = PushClient.inMemory(granted: true, status: .authorized)
+    let store = TestStore(initialState: SettingsFeature.State(connection: connection)) {
+      SettingsFeature()
+    } withDependencies: {
+      $0.push = push.client
+      $0.preferences = .inMemory()
+      $0.continuousClock = TestClock()
+      $0.hermesREST.registerPush = { @Sendable _, _, _, _ in }
+      $0.hermesREST.sendTestPush = { @Sendable _ in throw error }
+    }
+
+    await store.send(.sendTestPushTapped) {
+      $0.testPushStatus = .sending
+    }
+    push.emit(token: "tok-1")
+    await store.receive(\.testPushResult) {
+      $0.testPushStatus = .failed(error.message)
     }
   }
 
@@ -601,7 +628,7 @@ struct SettingsFeatureTests {
     // Advance past the bounded wait → the timeout wins, no token, registration fails.
     await clock.advance(by: .seconds(5))
     await store.receive(\.testPushResult) {
-      $0.testPushStatus = .failed
+      $0.testPushStatus = .failed("Couldn't register for notifications.")
     }
     #expect(sent.value == false) // never reached the test-send
   }
@@ -612,7 +639,7 @@ struct SettingsFeatureTests {
     let sent = LockIsolated(false)
     let registeredToken = LockIsolated<String?>(nil)
     let push = PushClient.inMemory(granted: true, status: .authorized)
-    var prefs = PreferencesClient.inMemory()
+    let prefs = PreferencesClient.inMemory()
     prefs.savePushDeviceToken("persisted-tok")
     let store = TestStore(initialState: SettingsFeature.State(connection: connection)) {
       SettingsFeature()

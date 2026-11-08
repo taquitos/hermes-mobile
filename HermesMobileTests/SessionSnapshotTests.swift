@@ -255,7 +255,7 @@ final class SessionSnapshotTests: SnapshotTestCase {
         ) {
           SessionListFeature().ignoring(\.task)
         } withDependencies: {
-          $0.hermesREST.sessions = { _, _, _, _, _ in sessions }
+          $0.hermesREST.sessions = { [sessions] _, _, _, _, _ in sessions }
           $0.continuousClock = ImmediateClock()
           $0.date = .constant(now)
         }
@@ -550,7 +550,7 @@ final class SessionSnapshotTests: SnapshotTestCase {
         ) {
           SessionListFeature().ignoring(\.task)
         } withDependencies: {
-          $0.hermesREST.sessions = { _, _, _, _, _ in sessions }
+          $0.hermesREST.sessions = { [sessions] _, _, _, _, _ in sessions }
           $0.continuousClock = ImmediateClock()
           $0.date = .constant(now)
         }

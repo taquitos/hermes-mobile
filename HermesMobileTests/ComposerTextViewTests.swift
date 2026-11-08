@@ -55,7 +55,7 @@ final class ComposerTextViewTests: XCTestCase {
     super.tearDown()
   }
 
-  private static let pngBytes = Data([0x89, 0x50, 0x4E, 0x47])
+  private nonisolated static let pngBytes = Data([0x89, 0x50, 0x4E, 0x47])
   private static let jpegBytes = Data([0xFF, 0xD8, 0xFF, 0xE0])
 
   private func stageImage(_ type: UTType = .png, bytes: Data = pngBytes) {

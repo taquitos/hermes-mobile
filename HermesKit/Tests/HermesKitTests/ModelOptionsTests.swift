@@ -142,6 +142,96 @@ struct ModelOptionsTests {
     #expect(result.map(\.name) == ["Anthropic", "DeepSeek", "OpenAI"])
   }
 
+  // MARK: Picker hide list (Nous Portal, GitHub Copilot)
+
+  /// A payload shaped like the live `model.options` response (live row names verified against
+  /// `GET /api/model/options`): the hidden rows come back configured (signed in) and
+  /// unconfigured-with-hint, and lookalike rows share their name/slug family.
+  private let nousBearingOptions = ModelOptions(providers: [
+    .init(name: "Anthropic", slug: "anthropic", models: ["claude-opus-4-8"], authenticated: true),
+    .init(name: "Nous Portal", slug: "nous",
+          models: ["nova-pro-v2", "llama-4-maverick"], authenticated: true,
+          capabilities: ["nova-pro-v2": .init(reasoning: true)]),
+    .init(name: "Nous Portal (SSO)", slug: "nous", models: [], authenticated: false,
+          warning: "sign in to nous to activate"),
+    .init(name: "Nous Proxy", slug: "custom:nous-proxy", models: ["nous-proxy-large"],
+          authenticated: true),
+    .init(name: "Ollama Cloud", slug: nil, models: ["qwen3-32b"], authenticated: true),
+    .init(name: "GitHub Copilot", slug: "copilot", models: ["gpt-5.1-codex"], authenticated: true),
+    .init(name: "GitHub Copilot ACP", slug: "copilot-acp", models: [], authenticated: false,
+          warning: "sign in to GitHub to activate"),
+    .init(name: "GitHub Copilot Enterprise", slug: "copilot-enterprise",
+          models: ["gpt-5.1"], authenticated: true),
+  ])
+
+  @Test func hiddenRowsNeverReachThePicker() {
+    #expect(nousBearingOptions.orderedProviders.map(\.name)
+              == ["Anthropic", "Nous Proxy", "Ollama Cloud", "GitHub Copilot Enterprise"])
+  }
+
+  @Test func hiddenRowsStayHiddenUnderSearch() {
+    // Section titles, model names, and hint text all used to surface these sections.
+    #expect(nousBearingOptions.filteredProviders(matching: "nous portal").isEmpty)
+    #expect(nousBearingOptions.filteredProviders(matching: "nova").isEmpty)
+    #expect(nousBearingOptions.filteredProviders(matching: "sign in to nous").isEmpty)
+    // The visible lookalike still matches its own name; the hidden rows never join it.
+    #expect(nousBearingOptions.filteredProviders(matching: "github copilot").map(\.name)
+              == ["GitHub Copilot Enterprise"])
+    #expect(nousBearingOptions.filteredProviders(matching: "gpt-5.1-codex").isEmpty)
+    #expect(nousBearingOptions.filteredProviders(matching: "sign in to GitHub").isEmpty)
+    // The unconfigured lock rows are gone too, not just the configured ones.
+    #expect(!nousBearingOptions.filteredProviders(matching: "a").contains {
+      ["nous", "copilot", "copilot-acp"].contains($0.slug ?? "")
+    })
+  }
+
+  @Test func hideMatchesSlugFirstAndLeavesSimilarlyNamedCustomRowsAlone() {
+    // Same display-name / slug families, different slugs → visible.
+    #expect(nousBearingOptions.filteredProviders(matching: "proxy").map(\.name) == ["Nous Proxy"])
+    #expect(nousBearingOptions.filteredProviders(matching: "copilot").map(\.name)
+              == ["GitHub Copilot Enterprise"])
+    // Hide list is slug-exact, not a prefix or substring.
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "custom:nous", name: "My Nous") == false)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "copilot-enterprise",
+                                               name: "Anything") == false)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "nous", name: "Anything") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "NOUS", name: "Anything") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "copilot", name: "Anything") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "copilot-acp", name: "Anything") == true)
+  }
+
+  @Test func nameFallbackOnlyAppliesWhenTheRowHasNoUsableSlug() {
+    #expect(ModelOptions.isHiddenPickerProvider(slug: nil, name: "Nous Portal") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: nil, name: "GitHub Copilot") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: nil, name: "GitHub Copilot ACP") == true)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "   ", name: "Nous") == true)
+    // Exact-name match only: a prefixed name with no slug stays visible.
+    #expect(ModelOptions.isHiddenPickerProvider(slug: nil, name: "Nous Portal EU Mirror") == false)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: nil,
+                                               name: "GitHub Copilot Enterprise") == false)
+    // A slug-carrying row is decided by its slug alone.
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "openai", name: "Nous Portal") == false)
+    #expect(ModelOptions.isHiddenPickerProvider(slug: "gh-enterprise",
+                                               name: "GitHub Copilot") == false)
+  }
+
+  @Test func hidingIsPickerSideOnlyTheDecodedPayloadKeepsTheRow() {
+    let json = #"""
+    {"model": "nova-pro-v2", "providers": [
+      {"name": "Nous Portal", "slug": "nous", "authenticated": true,
+       "models": ["nova-pro-v2"], "capabilities": {"nova-pro-v2": {"reasoning": true}}},
+      {"name": "GitHub Copilot", "slug": "copilot", "authenticated": true,
+       "models": ["gpt-5.1-codex"], "capabilities": {"gpt-5.1-codex": {"reasoning": false}}}
+    ]}
+    """#
+    let options = try! JSONDecoder().decode(ModelOptions.self, from: Data(json.utf8))
+    #expect(options.providers.map(\.name) == ["Nous Portal", "GitHub Copilot"])  // payload untouched
+    #expect(options.orderedProviders.isEmpty)                                     // picker hides both
+    // Capability lookup reads the raw list, so a hidden provider's model still resolves its flag.
+    #expect(options.supportsReasoning("nova-pro-v2") == true)
+    #expect(options.supportsReasoning("gpt-5.1-codex") == false)
+  }
+
   @Test func filteringKeepsAliases() {
     let options = ModelOptions(providers: [
       .init(name: "Local", slug: "local", models: ["qwen"], authenticated: true, aliases: ["custom:local"]),

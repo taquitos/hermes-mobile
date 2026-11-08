@@ -4,7 +4,7 @@ import Foundation
 /// (`WidgetSessionSnapshot`) into its container; the extension only reads it — it never
 /// touches the network or the Keychain.
 public enum AppGroup {
-  public static let identifier = "group.me.honcharenko.HermesMobile"
+  public static let identifier = "group.com.taquitos.HermesMobile"
   public static let snapshotFileName = "widget-sessions.json"
   /// The `kind` of the sessions widget — the one widget fed by the mirror, so the app reloads
   /// just its timelines after a write.

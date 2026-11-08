@@ -232,7 +232,7 @@ final class LoopbackCallbackListener: @unchecked Sendable {
       // port could otherwise grow `connections` without bound.
       connection.send(
         content: Self.responseData,
-        completion: .contentProcessed { _ in
+        completion: .contentProcessed { [weak self] _ in
           connection.cancel()
           self?.forget(connection)
         }

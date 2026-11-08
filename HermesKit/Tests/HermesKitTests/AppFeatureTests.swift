@@ -7134,6 +7134,7 @@ struct AppFeatureTests {
       (.connectionFailed(.delegate(.logoutConfirmed)), true),
       (.reauth(.presented(.delegate(.quit))), true),
     ] {
+      let actionLabel = String(describing: action)
       let tokenStore = BearerTokenStore()
       let logouts = LockIsolated(0)
       let unregisters = LockIsolated(0)
@@ -7169,11 +7170,11 @@ struct AppFeatureTests {
           #expect(deviceToken == "device-token-1")
           #expect(
             tokenStore.current == session,
-            "\(action): the store was drained before the push unregister could authenticate"
+            "\(actionLabel): the store was drained before the push unregister could authenticate"
           )
           #expect(
             logouts.value == 0,
-            "\(action): the unregister must run BEFORE the logout, not alongside it"
+            "\(actionLabel): the unregister must run BEFORE the logout, not alongside it"
           )
           unregisters.withValue { $0 += 1 }
         }
@@ -7181,9 +7182,9 @@ struct AppFeatureTests {
           #expect(posted == connection)
           #expect(
             tokenStore.current == session,
-            "\(action): the store was drained before the logout could authenticate"
+            "\(actionLabel): the store was drained before the logout could authenticate"
           )
-          #expect(unregisters.value == 1, "\(action): the unregister must have already run")
+          #expect(unregisters.value == 1, "\(actionLabel): the unregister must have already run")
           // Both hops authenticate through the store, so either can rotate a pair inside
           // its refresh leeway. That rotation must NOT reach the Keychain entry the reducer
           // already deleted — persistence is detached before this runs.

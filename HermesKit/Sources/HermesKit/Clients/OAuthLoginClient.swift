@@ -284,7 +284,7 @@ private func awaitCallback(
   /// Supplies the presentation anchor. The anchor is captured on the main actor at
   /// session-creation time so the (non-isolated) protocol callback just hands it back.
   private final class BrowserPresenter: NSObject, ASWebAuthenticationPresentationContextProviding {
-    private nonisolated(unsafe) let anchor: ASPresentationAnchor
+    private let anchor: ASPresentationAnchor
 
     init(anchor: ASPresentationAnchor) {
       self.anchor = anchor

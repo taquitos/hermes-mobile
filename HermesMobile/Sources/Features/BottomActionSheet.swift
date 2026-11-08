@@ -1,4 +1,4 @@
-import ComposableArchitecture
+@_spi(Internals) import ComposableArchitecture
 import SwiftUI
 
 extension View {
@@ -38,11 +38,10 @@ struct BottomActionSheetView<Action>: View {
   @State private var contentHeight: CGFloat = 200
 
   var body: some View {
-    // `withState` is the only public read for a store of plain (non-`@ObservableState`)
-    // value state — TCA's own `alert(_:)`/`confirmationDialog(_:)` presenters read the
-    // same way; the deprecation is a nudge toward `@ObservableState`, which
-    // `ConfirmationDialogState` doesn't adopt. Accepted warning.
-    let state = store.withState { $0 }
+    // The sheet opens from the parent store's presentation binding. Read the dialog
+    // from the scoped store when drawing the sheet. TCA's public `state` accessor
+    // requires `ObservableState`, which `ConfirmationDialogState` does not conform to.
+    let state = store.currentState
     VStack(spacing: 20) {
       VStack(spacing: 6) {
         // Hidden only on an explicit `.hidden`: unlike the system dialog (which also

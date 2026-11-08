@@ -113,7 +113,7 @@ extension Reducer where Action: CasePathable {
   func ignoring<V>(_ startupAction: CaseKeyPath<Action, V>) -> some Reducer<State, Action> {
     Reduce { state, action in
       guard action[case: startupAction] == nil else { return .none }
-      return self.reduce(into: &state, action: action)
+      return self._reduce(into: &state, action: action)
     }
   }
 }

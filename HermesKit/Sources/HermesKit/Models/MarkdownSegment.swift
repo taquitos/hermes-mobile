@@ -23,6 +23,11 @@ public enum MarkdownSegment: Equatable, Sendable {
   /// A GitHub-style pipe table: the header cells plus zero+ body rows (each an array of
   /// cells). Cells are trimmed; inline Markdown applies within each cell.
   case table(headers: [String], rows: [[String]])
+  /// A standalone image on its own line — either Markdown `![alt](url)` or a bare
+  /// `MEDIA:<ref>` tag the gateway emits for agent-produced files. `url` is the raw
+  /// reference (an http(s) URL, a `data:` URL, or a server path awaiting resolution);
+  /// `alt` is the Markdown alt text (empty for `MEDIA:` lines).
+  case image(url: String, alt: String)
 
   /// Split `text` into segments. The fence lines themselves are dropped, but the opening
   /// fence's language hint is retained on the code segment. An unterminated fence (as seen
@@ -77,6 +82,16 @@ public enum MarkdownSegment: Equatable, Sendable {
 
       if inCode {
         codeBuffer.append(line)
+        i += 1
+        continue
+      }
+
+      // Standalone image: a whole line that is a Markdown image or a bare `MEDIA:` tag.
+      // Images are block-level here so they lay out as their own row rather than being
+      // swallowed by `AttributedString(markdown:)`, which can't render pictures.
+      if let image = parseImage(trimmedLine) {
+        flushProse()
+        result.append(image)
         i += 1
         continue
       }
@@ -156,6 +171,32 @@ public enum MarkdownSegment: Equatable, Sendable {
 
   static func isBlockquoteLine(_ trimmed: String) -> Bool {
     trimmed.hasPrefix(">")
+  }
+
+  /// Parse a standalone image line: Markdown `![alt](url)` or a bare `MEDIA:<ref>` tag.
+  /// Returns `nil` for anything else so prose keeps its inline-copy behavior. Only the
+  /// reference is stored — resolution to a fetchable URL happens at the view layer.
+  static func parseImage(_ trimmed: String) -> MarkdownSegment? {
+    // Strip wrapping quotes/backticks first so a quoted `MEDIA:` tag still classifies.
+    let trimmed = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+    guard !trimmed.isEmpty else { return nil }
+
+    // Markdown image: ![alt](url) — the whole line must be the image.
+    if trimmed.hasPrefix("!["), let close = trimmed.range(of: "](") {
+      let alt = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 2)..<close.lowerBound])
+      let afterParen = trimmed[close.upperBound...]
+      guard afterParen.hasSuffix(")") else { return nil }
+      let url = String(trimmed[close.upperBound..<trimmed.index(before: trimmed.endIndex)])
+        .trimmingCharacters(in: .whitespaces)
+      guard !url.isEmpty, !url.contains(" ") else { return nil }
+      return .image(url: url, alt: alt)
+    }
+
+    // Bare MEDIA: tag.
+    guard trimmed.hasPrefix("MEDIA:") else { return nil }
+    let ref = String(trimmed.dropFirst("MEDIA:".count)).trimmingCharacters(in: .whitespaces)
+    guard !ref.isEmpty else { return nil }
+    return .image(url: ref, alt: "")
   }
 
   static func stripBlockquoteMarker(_ trimmed: String) -> String {

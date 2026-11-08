@@ -1638,7 +1638,8 @@ struct HydrateTests {
       $0.hermesGateway.send = { @Sendable _, _ in
         // Hang until cancelled (the empty stream never yields; cancellation ends the
         // iteration), then surface the drop the way the live client would.
-        for await _ in AsyncStream<Never> { _ in } {}
+        let emptyStream = AsyncStream<Never> { _ in }
+        for await _ in emptyStream {}
         throw GatewayError.disconnected
       }
     }

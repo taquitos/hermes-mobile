@@ -49,8 +49,12 @@ make snapshot-record  # re-record SwiftUI snapshot baselines
   destination too — `SIM_NAME="iPad Pro 13-inch (M4)" make run` for the split layout.
 - **Device** (`scripts/run-device.sh`) needs automatic signing —
   `DEVELOPMENT_TEAM=<your 10-char team id> make run-device`. The team is baked in at
-  generate time. See **Signing & contributor setup** below for running on your own
-  device with your own Apple Developer account.
+  generate time. The script selects one connected, paired physical iPhone or iPad from
+  `devicectl` JSON, excluding simulators. If several devices qualify, set `DEVICE_UDID`
+  to the intended hardware UDID or `DEVICE_ID` to its CoreDevice identifier. It does not
+  assume a particular identifier length. `HERMES_DEFAULT_SERVER_URL` is forwarded to
+  Tuist alongside the team. See **Signing & contributor setup** below for running on
+  your own device with your own Apple Developer account.
 - **Tests** (`scripts/test.sh`) wrap `swift test` in a pseudo-TTY so output streams
   live (a bare pipe buffers until exit).
 - **Snapshots** (`scripts/snapshot.sh`) render the SwiftUI views via SnapshotTesting
@@ -71,13 +75,13 @@ make snapshot-record  # re-record SwiftUI snapshot baselines
 
 ## Targets and the App Group
 
-`Project.swift` defines three targets: the app `HermesMobile` (`me.honcharenko.HermesMobile`),
-the widget extension `HermesWidgets` (`me.honcharenko.HermesMobile.Widgets`, embedded in the
+`Project.swift` defines three targets: the app `HermesMobile` (`com.taquitos.HermesMobile`),
+the widget extension `HermesWidgets` (`com.taquitos.HermesMobile.Widgets`, embedded in the
 app; widgets, Control Center controls and the Live Activity) and `HermesMobileTests`. The
 extension links only the Foundation-only `HermesWidgetKit` product of the HermesKit package
 (`APPLICATION_EXTENSION_API_ONLY = YES`), never HermesKit itself.
 
-- **Both** app and extension carry the App Group `group.me.honcharenko.HermesMobile`
+- **Both** app and extension carry the App Group `group.com.taquitos.HermesMobile`
   (`appGroupIdentifier` in `Project.swift`, `AppGroup.identifier` in HermesWidgetKit; keep
   them equal). The app writes the sessions-widget mirror into its container; the extension
   only reads it.
@@ -108,8 +112,12 @@ no shared identity to clone.
 
 ### Run on your own device
 
-You only need a free or paid Apple Developer account and your 10-character Team ID
-(Apple Developer portal → Membership, or Xcode → Settings → Accounts).
+Use your own Apple Developer team and its 10-character Team ID
+(Apple Developer portal → Membership, or Xcode → Settings → Accounts). This fork uses
+`com.taquitos.HermesMobile` for the app and `com.taquitos.HermesMobileTests` for tests.
+The app target includes the Push Notifications entitlement, so its provisioning profile
+must support that capability. The current manifest does not provide a separate configuration
+without push for a free Personal Team. Simulator builds do not require signing or a team.
 
 ```sh
 # Sign in once: Xcode → Settings → Accounts → "+" → add your Apple ID.
@@ -117,23 +125,51 @@ You only need a free or paid Apple Developer account and your 10-character Team 
 DEVELOPMENT_TEAM=<your team id> make run-device
 ```
 
-`make run-device` uses **automatic** signing with `-allowProvisioningUpdates`, so Xcode
-creates the development certificate and a matching provisioning profile for your team on
-the fly — nothing to set up by hand. The bundle id (`me.honcharenko.HermesMobile`) is
-fine to build under any team for local/dev runs; only App Store/TestFlight distribution
-needs the registered id. If you hit a bundle-id conflict, change `bundleId` in
-`Project.swift` to something unique to you and re-run `make generate`. Change the
-extension's `bundleId` with it (it must stay prefixed by the app's, e.g.
-`<yours>.Widgets`), and if the App Group id is taken too, change `appGroupIdentifier` in
-`Project.swift` AND `AppGroup.identifier` in `HermesKit/Sources/HermesWidgetKit/AppGroup.swift`
-together. Automatic signing registers the extension id and the App Group for your team.
+`make run-device` uses **automatic** signing with `-allowProvisioningUpdates`, allowing
+Xcode to create or update signing assets for your selected team. The app and widget bundle
+IDs and their shared App Group must be available to that team. If you need different IDs,
+change `appBundleIdentifier` and the test target's `bundleId` in `Project.swift`, update the
+app's `BUNDLE_ID` in `scripts/run-sim.sh` and `scripts/run-device.sh`, and regenerate the
+project. The widget bundle ID and App Group in `Project.swift` follow `appBundleIdentifier`.
+Update `AppGroup.identifier` in `HermesKit/Sources/HermesWidgetKit/AppGroup.swift` to match
+so both targets can access the same container. Keep the Team ID in the environment and
+signing assets and server credentials out of the repo.
 
 The default server URL can be baked in at generate time (otherwise enter it in the app's
 onboarding screen):
 
 ```sh
-HERMES_DEFAULT_SERVER_URL=http://<tailnet-host>:9119 make generate
+TUIST_SERVER_URL=http://<tailnet-host>:9119 make generate
 ```
+
+For a device run, use `HERMES_DEFAULT_SERVER_URL` instead; the script translates it at
+generation time. Device-selection regression tests run without Xcode or a connected phone:
+
+```sh
+/usr/bin/python3 -m unittest discover -s scripts/tests -p 'test_select_device.py'
+```
+
+### Push notifications for this fork
+
+Chat and agent controls connect directly to your Hermes server and do not require a push
+relay. Background push notifications need additional infrastructure owned by this fork:
+an APNs-enabled app identifier, credentials from its Apple Developer team, and a compatible
+push relay configured for `com.taquitos.HermesMobile`. APNs associates provider credentials
+with a team and its app topics, so the upstream publisher's relay cannot be assumed to send
+notifications to this independently signed app. See Apple's
+[APNs authentication documentation](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns).
+
+The existing `hermes-push` plugin defaults to the upstream publisher's relay. Point each
+intended Hermes runtime at an independently configured relay with
+`HERMES_PUSH_GATEWAY_URL=<relay-url>/push`, then restart that runtime. The relay must provide
+the plugin's `/register` device-capability exchange and `/push` delivery protocol; see the
+[plugin configuration](https://github.com/goncharik/hermes-mobile-push-plugin#configuration).
+Keep the APNs private key on the relay, never in the app or repository. Preserve the existing
+environment pairing: Debug uses sandbox APNs and a development entitlement; Release uses
+production APNs and a production entitlement.
+
+No independent relay is deployed by this repository's build or run scripts. Building this
+fork does not configure or verify background push delivery.
 
 ### Maintainer: distribution signing assets
 
@@ -167,8 +203,8 @@ asc --profile hermes profiles download --id <profile id> \
 ```
 
 **Both bundle ids need the App Group.** Register
-`me.honcharenko.HermesMobile.Widgets` next to the app's id, register the App Group
-`group.me.honcharenko.HermesMobile`, and enable the App Groups capability with that group
+`com.taquitos.HermesMobile.Widgets` next to the app's id, register the App Group
+`group.com.taquitos.HermesMobile`, and enable the App Groups capability with that group
 on BOTH ids (Developer portal → Identifiers) before creating the profiles. A profile made
 before the capability was enabled lacks the entitlement and must be regenerated: the export
 fails when a profile doesn't cover an entitlement the target signs with.
@@ -213,8 +249,8 @@ export needs a profile for EACH bundle id; `ExportOptions.plist` lists both:
 <key>signingCertificate</key><string>Apple Distribution</string>
 <key>provisioningProfiles</key>
 <dict>
-  <key>me.honcharenko.HermesMobile</key><string>HermesMobile AppStore</string>
-  <key>me.honcharenko.HermesMobile.Widgets</key><string>HermesMobile Widgets AppStore</string>
+  <key>com.taquitos.HermesMobile</key><string>HermesMobile AppStore</string>
+  <key>com.taquitos.HermesMobile.Widgets</key><string>HermesMobile Widgets AppStore</string>
 </dict>
 ```
 

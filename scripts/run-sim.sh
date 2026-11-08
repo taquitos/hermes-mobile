@@ -13,7 +13,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SCHEME="HermesMobile"
 WORKSPACE="HermesMobile.xcworkspace"
-BUNDLE_ID="me.honcharenko.HermesMobile"
+BUNDLE_ID="com.taquitos.HermesMobile"
 SIM_NAME="${1:-${SIM_NAME:-iPhone 17 Pro}}"
 
 # Tuist only forwards TUIST_-prefixed env vars to the manifest, so translate.

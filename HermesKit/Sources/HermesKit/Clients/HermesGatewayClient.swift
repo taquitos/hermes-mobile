@@ -372,7 +372,7 @@ actor GatewayConnection {
         ? longRequestTimeout : requestTimeout
       timeoutTasks[id] = Task { [budget, clock] in
         do { try await clock.sleep(for: budget) } catch { return }
-        await fireTimeout(id: id, method: method)
+        fireTimeout(id: id, method: method)
       }
       Task { await transmit(id: id, text: text) }
     }

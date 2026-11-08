@@ -166,7 +166,7 @@ struct WidgetSnapshotTests {
   }
 
   @Test func appGroupIsPinned() {
-    #expect(AppGroup.identifier == "group.me.honcharenko.HermesMobile")
+    #expect(AppGroup.identifier == "group.com.taquitos.HermesMobile")
     #expect(AppGroup.snapshotFileName == "widget-sessions.json")
   }
 

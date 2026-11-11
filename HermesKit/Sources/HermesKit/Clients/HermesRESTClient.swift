@@ -113,7 +113,7 @@ public struct ServerStatus: Equatable, Sendable, Decodable {
   public var authProviders: [String]?
   /// Interactive login flows the gate supports — gated servers report `["cookie"]`, plus
   /// `"native_pkce"` once any interactive session provider is registered. Absent on older
-  /// gateways (treat absent as "no native flow": the OAuth segment needs positive evidence).
+  /// gateways (treat absent as "no native flow": a provider button needs positive evidence).
   public var authFlows: [String]?
 
   enum CodingKeys: String, CodingKey {
@@ -201,6 +201,15 @@ public enum RESTError: Error, Equatable, Sendable {
 public struct HermesRESTClient: Sendable {
   /// Unauthenticated reachability/health probe.
   public var status: @Sendable (_ baseURL: URL) async throws -> ServerStatus
+  /// The onboarding Server step's probe (#136): the same unauthenticated `GET /api/status`
+  /// as `status`, but every failure is classified from the RAW `URLError` / HTTP response
+  /// into a typed `ProbeFailure` (a 2xx body without a Hermes `version` is `.notHermes`), so each
+  /// failure card can say what went wrong. Never throws. The launch path keeps `status`.
+  public var probeStatus: @Sendable (_ baseURL: URL) async -> Result<ServerStatus, ProbeFailure> = { _ in
+    // `@DependencyClient` needs a default for a non-throwing closure; an unstubbed call
+    // still reports an unimplemented issue in tests.
+    .failure(.requestFailed("probeStatus is unimplemented"))
+  }
   /// Public capability probe — `GET /api/auth/providers` → `[{name, display_name,
   /// supports_password}]`. Returns `nil` on older servers that 404 this endpoint (treat as
   /// token-only); other transport/HTTP errors still throw.
@@ -241,6 +250,9 @@ public struct HermesRESTClient: Sendable {
   /// `false` on every open both acknowledges current activity and starts tracking a legacy
   /// row whose server watermark is still nil. `profile` follows the archive/rename rule.
   public var setUnread: @Sendable (_ connection: ServerConnection, _ id: String, _ unread: Bool, _ profile: String?) async throws -> Void
+  /// Set Desktop-shared pin state — `PATCH /api/sessions/{id}` `{"pinned":…}`.
+  /// `profile` scopes the mutation to the session's owning profile.
+  public var setPinned: @Sendable (_ connection: ServerConnection, _ id: String, _ pinned: Bool, _ profile: String?) async throws -> Void
   /// Rename a session — `PATCH /api/sessions/{id}` `{"title":…}`. An empty title clears it.
   /// The server may reject with 400 (too long / invalid chars / duplicate).
   /// `profile` follows the archive rule.
@@ -291,6 +303,16 @@ public struct HermesRESTClient: Sendable {
   public var pauseCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
   /// Resume a paused cron job — `POST /api/cron/jobs/{id}/resume`. `profile` as above.
   public var resumeCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// Delete a cron job — `DELETE /api/cron/jobs/{id}` (no body). `profile` as above. An
+  /// unknown job surfaces as `RESTError.notFound` (the caller treats it as already gone); a
+  /// malformed id is a 400 whose `detail` rides in `RESTError.server`.
+  public var deleteCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// A cron job's recent runs — `GET /api/cron/jobs/{id}/runs?limit=` (upstream clamps `limit`
+  /// to 1–100), newest first. `profile` as above. Rows have the `/api/sessions` shape: session
+  /// runs carry `source: "cron"`; script-only runs carry `source: "cron_output"`, a synthetic
+  /// `cron_output:…` id (or none) and no backing session. A row that doesn't decode (no `id`)
+  /// is dropped rather than failing the list.
+  public var cronJobRuns: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?, _ limit: Int) async throws -> [Session]
   /// Authoritative readiness probe for the `hermes-push` plugin — `GET /api/dashboard/plugins/hub`
   /// → `{plugins: [{name, runtime_status, …}], …}`. Matches the plugin by `name == "hermes-push"`
   /// and maps: `runtime_status == "enabled"` → `.ready`; present-but-not-enabled or absent →
@@ -350,6 +372,9 @@ public extension HermesRESTClient {
     return HermesRESTClient(
       status: { baseURL in
         try await get(makeURL(baseURL, "/api/status"), auth: .none, session: session)
+      },
+      probeStatus: { baseURL in
+        await HermesKit.probeStatus(baseURL: baseURL, session: session)
       },
       authProviders: { baseURL in
         do {
@@ -439,6 +464,14 @@ public extension HermesRESTClient {
         let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
         let url = try makeURL(conn.baseURL, "/api/sessions/\(id)", query: query)
         var payload: [String: Any] = ["unread": unread]
+        if let profile { payload["profile"] = profile }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        try await send(url, method: "PATCH", body: body, auth: authFor(conn), session: session)
+      },
+      setPinned: { conn, id, pinned, profile in
+        let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+        let url = try makeURL(conn.baseURL, "/api/sessions/\(id)", query: query)
+        var payload: [String: Any] = ["pinned": pinned]
         if let profile { payload["profile"] = profile }
         let body = try JSONSerialization.data(withJSONObject: payload)
         try await send(url, method: "PATCH", body: body, auth: authFor(conn), session: session)
@@ -555,6 +588,18 @@ public extension HermesRESTClient {
           conn, id: id, action: "resume", profile: profile,
           auth: authFor(conn), session: session
         )
+      },
+      deleteCronJob: { conn, id, profile in
+        let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+        let url = try makeURL(conn.baseURL, "/api/cron/jobs/\(id)", query: query)
+        try await send(url, method: "DELETE", body: nil, auth: authFor(conn), session: session)
+      },
+      cronJobRuns: { conn, id, profile, limit in
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let profile { query.append(URLQueryItem(name: "profile", value: profile)) }
+        let url = try makeURL(conn.baseURL, "/api/cron/jobs/\(id)/runs", query: query)
+        let response: CronRunsResponse = try await get(url, auth: authFor(conn), session: session)
+        return response.runs
       },
       pushPluginStatus: { conn in
         await fetchPushPluginInfo(conn, authFor: authFor, session: session).status
@@ -850,6 +895,48 @@ func get<T: Decodable>(_ url: URL, auth: RequestAuth, session: URLSession) async
   }
 }
 
+/// The onboarding probe's per-request timeout, in seconds.
+let probeStatusTimeout: TimeInterval = 10
+
+/// `GET /api/status` for the onboarding probe, classifying every failure as a `ProbeFailure`
+/// instead of flattening it to `RESTError` (see `HermesRESTClient.probeStatus`).
+func probeStatus(baseURL: URL, session: URLSession) async -> Result<ServerStatus, ProbeFailure> {
+  guard let url = try? makeURL(baseURL, "/api/status") else {
+    return .failure(.requestFailed("“\(baseURL.absoluteString)” is not a valid server address."))
+  }
+
+  var request = URLRequest(url: url)
+  // Short, so a host that drops packets fails within seconds per candidate, not a minute.
+  request.timeoutInterval = probeStatusTimeout
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    return .failure(ProbeFailure.classify(error))
+  }
+
+  guard let http = response as? HTTPURLResponse else {
+    return .failure(.requestFailed("The server sent a response that isn’t HTTP."))
+  }
+  // Every Hermes `/api/status` reports its `version`, signed out included; a 2xx JSON
+  // object without one is some other service.
+  if (200..<300).contains(http.statusCode),
+    let status = try? JSONDecoder().decode(ServerStatus.self, from: data),
+    status.version != nil
+  {
+    return .success(status)
+  }
+  // A non-2xx, or a 2xx whose body isn't Hermes `/api/status` JSON (→ `.notHermes`).
+  return .failure(
+    ProbeFailure.classify(
+      httpStatus: http.statusCode,
+      contentType: http.value(forHTTPHeaderField: "Content-Type"),
+      detail: serverDetail(from: data)
+    )
+  )
+}
+
 /// Validate an HTTP response status, mapping non-success codes to `RESTError`. The
 /// response `data` is read on failure so the server's error `detail` is surfaced
 /// verbatim (see `serverDetail`).
@@ -986,6 +1073,26 @@ private struct SessionsResponse: Decodable {
   let total: Int?
 }
 
+/// `GET /api/cron/jobs/{id}/runs` → `{"runs": [...], "limit": n}`. Each row decodes on its own
+/// through `SessionListDTO`: a row that fails (a script-only `cron_output` row without an `id`)
+/// is dropped instead of failing the whole list. A missing `runs` key yields `[]`.
+private struct CronRunsResponse: Decodable {
+  let runs: [Session]
+
+  enum CodingKeys: String, CodingKey { case runs }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    runs = (try c.decodeIfPresent([LenientRow].self, forKey: .runs) ?? []).compactMap { $0.dto?.asSession }
+  }
+
+  /// Swallows a single row's decoding failure so the array decode carries on past it.
+  private struct LenientRow: Decodable {
+    let dto: SessionListDTO?
+    init(from decoder: Decoder) throws { dto = try? SessionListDTO(from: decoder) }
+  }
+}
+
 /// `GET /api/auth/providers`. The server wraps the list in an object
 /// (`{"providers":[…]}`); we also tolerate a bare top-level array for safety.
 private struct AuthProvidersResponse: Decodable {
@@ -1013,6 +1120,7 @@ struct SessionListDTO: Decodable {
   let startedAt: Double?
   let messageCount: Int?
   let unread: Bool?
+  let pinned: Bool?
   let cwd: String?
   let isActive: Bool?
   let source: String?
@@ -1025,7 +1133,7 @@ struct SessionListDTO: Decodable {
     case lastActive = "last_active"
     case startedAt = "started_at"
     case messageCount = "message_count"
-    case unread
+    case unread, pinned
     case isActive = "is_active"
     case parentSessionID = "parent_session_id"
     // Present only on compression-projected rows: the ORIGINAL id the row had before the
@@ -1043,6 +1151,7 @@ struct SessionListDTO: Decodable {
       startedAt: startedAt.map { Date(timeIntervalSince1970: $0) },
       messageCount: messageCount,
       unread: unread,
+      pinned: pinned,
       isActive: isActive,
       source: source,
       parentSessionID: parentSessionID?.trimmedNonEmpty,
@@ -1061,10 +1170,11 @@ private struct SearchResultDTO: Decodable {
   let sessionID: String
   let snippet: String?
   let sessionStarted: Double?
+  let pinned: Bool?
 
   enum CodingKeys: String, CodingKey {
     case sessionID = "session_id"
-    case snippet
+    case snippet, pinned
     case sessionStarted = "session_started"
   }
 
@@ -1073,7 +1183,8 @@ private struct SearchResultDTO: Decodable {
       id: sessionID,
       title: nil,
       updatedAt: sessionStarted.map { Date(timeIntervalSince1970: $0) },
-      preview: snippet?.nonEmpty
+      preview: snippet?.nonEmpty,
+      pinned: pinned
     )
   }
 }

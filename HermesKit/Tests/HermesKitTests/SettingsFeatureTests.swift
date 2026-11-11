@@ -16,11 +16,14 @@ struct SettingsFeatureTests {
     preferences.saveSeenCounts(["s1": 4])
     preferences.saveDefaultSessionSwipeAction(.delete)
     preferences.saveSelectedProfileID("staging")
+    preferences.savePinMigration("https://first", PinMigration(pendingIDs: ["legacy"]))
+    preferences.savePinMigration("https://second", PinMigration(pendingIDs: []))
     preferences.saveAutoSpeakReplies(true)
     preferences.saveCollapsedModelProviders(["openrouter"])
     preferences.saveFavoriteModels([FavoriteModel(providerID: "anthropic", model: "claude-opus-4-6")])
     preferences.saveLiveActivityEnabled(false)
     preferences.saveLiveActivityShowsTitles(false)
+    preferences.saveOnboardingTipsDismissed(true)
     let store = TestStore(initialState: SettingsFeature.State(connection: connection)) {
       SettingsFeature()
     } withDependencies: {
@@ -38,11 +41,14 @@ struct SettingsFeatureTests {
     #expect(preferences.loadSeenCounts() == [:]) // unread state cleared too
     #expect(preferences.loadDefaultSessionSwipeAction() == .archive) // swipe pref reset on logout
     #expect(preferences.loadSelectedProfileID() == nil) // selected profile cleared on logout
+    #expect(preferences.loadPinMigration("https://first") == nil)
+    #expect(preferences.loadPinMigration("https://second") == nil)
     #expect(preferences.loadAutoSpeakReplies() == false) // read-aloud toggle off after logout
     #expect(preferences.loadCollapsedModelProviders() == []) // model picker prefs (#130)
     #expect(preferences.loadFavoriteModels() == [])
     #expect(preferences.loadLiveActivityEnabled()) // Live Activity toggles back on (#138)
     #expect(preferences.loadLiveActivityShowsTitles())
+    #expect(preferences.loadOnboardingTipsDismissed() == false) // list tips shown again (#136)
   }
 
   /// The gateway event log belongs to the old server: sign out empties it, so a later
@@ -118,10 +124,17 @@ struct SettingsFeatureTests {
     }
     await store.send(.saveTokenTapped) {
       $0.connection.token = "newtok"
-      $0.agentUpdate.connection.token = "newtok"
       $0.savedConfirmation = true
     }
     await store.receive(\.delegate.tokenSaved)
+    // The updater re-probes with the new token (the default stub lacks the endpoint).
+    await store.receive(\.agentUpdate.task) {
+      $0.agentUpdate.phase = .checking
+    }
+    await store.receive(\.agentUpdate.checked) {
+      $0.agentUpdate.phase = .hidden
+    }
+    #expect(store.state.agentUpdate.connection.token == "newtok")
     #expect(saved.value == "newtok")
   }
 
@@ -164,7 +177,6 @@ struct SettingsFeatureTests {
     #expect(store.state.versionLabel == "Version 1.0 (79)")
     #expect(store.state.selectedAppIconLabel == "Hermes Neo")
     #expect(store.state.selectedAppIconOption?.previewAsset == "AppIconPreview-AppIconHermesNeo")
-    await store.send(.doneTapped)
   }
 
   /// A failed `/api/status` probe leaves the version `nil` (Agent row hidden) — no banner,
@@ -186,7 +198,6 @@ struct SettingsFeatureTests {
     #expect(store.state.agentVersion == nil)
     #expect(debugLog.snapshot().map(\.type) == ["api.status"])
     #expect(debugLog.snapshot().map(\.summary) == [RESTError.unreachable.message])
-    await store.send(.doneTapped)
   }
 
   /// An agent that answers `/api/status` without a version also leaves the row hidden.
@@ -204,7 +215,6 @@ struct SettingsFeatureTests {
 
     await store.send(.task)
     await store.receive(\.agentStatusLoaded) { $0.agentVersion = nil }
-    await store.send(.doneTapped)
   }
 
   // MARK: Derived labels (#137)
@@ -482,7 +492,6 @@ struct SettingsFeatureTests {
       $0.notificationsEnabled = true
       $0.notificationsDenied = false
     }
-    await store.send(.doneTapped)
   }
 
   @Test func toggleOnWhenGrantedEnablesAndRegisters() async {
@@ -682,7 +691,6 @@ struct SettingsFeatureTests {
     }
     #expect(store.state.pluginUpdateAvailable)
     #expect(!store.state.pluginUpdateNeedsManualSteps)
-    await store.send(.doneTapped)
   }
 
   /// Outdated but NOT a git checkout → no button (it would only 400); route to the guide.
@@ -701,7 +709,6 @@ struct SettingsFeatureTests {
     await store.receive(\.pushPluginInfoLoaded)
     #expect(!store.state.pluginUpdateAvailable)
     #expect(store.state.pluginUpdateNeedsManualSteps)
-    await store.send(.doneTapped)
   }
 
   /// A current plugin — and an agent that reports no version at all — offer nothing.
@@ -723,7 +730,6 @@ struct SettingsFeatureTests {
       await store.receive(\.pushPluginInfoLoaded)
       #expect(!store.state.pluginUpdateAvailable)
       #expect(!store.state.pluginUpdateNeedsManualSteps)
-      await store.send(.doneTapped)
     }
   }
 
@@ -928,7 +934,6 @@ struct SettingsFeatureTests {
       await store.send(.task) {
         $0.liveActivitiesAllowedBySystem = allowed
       }
-      await store.send(.doneTapped)
     }
   }
 }

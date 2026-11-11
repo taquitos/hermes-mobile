@@ -5,6 +5,15 @@ import Foundation
 /// Serializes the owned-update slot's read-modify-write (compare-and-clear) across threads.
 private let ownedUpdateLock = NSLock()
 
+/// Legacy pins not yet reconciled with server membership.
+/// Server-keyed pending IDs survive incomplete lists, profile switches, and failed
+/// writes. Retire them only on explicit server true or an acknowledged upload.
+public struct PinMigration: Codable, Equatable, Sendable {
+  public var pendingIDs: [String]
+
+  public init(pendingIDs: [String]) { self.pendingIDs = pendingIDs }
+}
+
 /// Non-secret, persisted app preferences. Currently just the last server URL, kept so
 /// the app can auto-reconnect on launch without re-running onboarding (the token lives
 /// in `KeychainClient`). Live implementation backs onto `UserDefaults`; an in-memory
@@ -20,6 +29,10 @@ public struct PreferencesClient: Sendable {
   /// Pinned session ids, ordered = display order in the top "Pinned" section.
   public var loadPinnedIDs: @Sendable () -> [String] = { [] }
   public var savePinnedIDs: @Sendable (_ ids: [String]) -> Void
+  /// Legacy pin migration snapshots keyed by stable server URL, never by bearer token.
+  public var loadPinMigration: @Sendable (_ server: String) -> PinMigration? = { _ in nil }
+  public var savePinMigration: @Sendable (_ server: String, _ migration: PinMigration) -> Void
+  public var clearPinMigrations: @Sendable () -> Void
   /// Which destructive action the session list's trailing swipe defaults to
   /// (archive vs permanent delete). Device-local UI pref; reset on logout.
   public var loadDefaultSessionSwipeAction: @Sendable () -> SessionSwipeAction = { .default }
@@ -74,6 +87,12 @@ public struct PreferencesClient: Sendable {
   /// Compare-and-clear: drops the slot only while it still names `actionID`, so settling an
   /// old run can't erase a newer one; `nil` clears whatever is stored (logout).
   public var clearOwnedAgentUpdate: @Sendable (_ actionID: String?) -> Void
+  /// Whether the user hid the session list's onboarding tips row (#136). Device-local UI pref,
+  /// default `false` (tips shown). Cleared on logout, so the next sign-in shows them again;
+  /// deliberately NOT identity-scoped — a re-auth user switch keeps it.
+  public var loadOnboardingTipsDismissed: @Sendable () -> Bool = { false }
+  public var saveOnboardingTipsDismissed: @Sendable (_ dismissed: Bool) -> Void
+  public var clearOnboardingTipsDismissed: @Sendable () -> Void
 }
 
 public extension PreferencesClient {
@@ -93,6 +112,7 @@ public extension PreferencesClient {
   /// The server URL (and the list's UI prefs) survive — the user stays on the same server.
   func clearIdentityScopedPrefs() {
     savePinnedIDs([])
+    clearPinMigrations()
     saveSeenCounts([:])
     clearSelectedProfileID()
   }
@@ -104,6 +124,7 @@ public extension PreferencesClient {
     let key = "hermes.server-url"
     let seenKey = "hermes.seen-message-counts"
     let pinnedKey = "hermes.pinned-session-ids"
+    let migrationKey = "hermes.pin-migrations-v1"
     let swipeActionKey = "hermes.default-session-swipe-action"
     let selectedProfileKey = "hermes.selected-profile-id"
     let pushTokenKey = "hermes.push-device-token"
@@ -115,6 +136,7 @@ public extension PreferencesClient {
     let liveActivityKey = "hermes.live-activity-enabled"
     let liveActivityTitlesKey = "hermes.live-activity-shows-titles"
     let ownedUpdateKey = "hermes.agent-update-owned"
+    let onboardingTipsDismissedKey = "hermes.onboarding-tips-dismissed"
     // UserDefaults is documented thread-safe but not Sendable.
     nonisolated(unsafe) let store = defaults
 
@@ -134,6 +156,17 @@ public extension PreferencesClient {
       saveSeenCounts: { store.set($0, forKey: seenKey) },
       loadPinnedIDs: { (store.array(forKey: pinnedKey) as? [String]) ?? [] },
       savePinnedIDs: { store.set($0, forKey: pinnedKey) },
+      loadPinMigration: { server in
+        guard let data = store.dictionary(forKey: migrationKey)?[server] as? Data else { return nil }
+        return try? JSONDecoder().decode(PinMigration.self, from: data)
+      },
+      savePinMigration: { server, migration in
+        guard let data = try? JSONEncoder().encode(migration) else { return }
+        var migrations = store.dictionary(forKey: migrationKey) ?? [:]
+        migrations[server] = data
+        store.set(migrations, forKey: migrationKey)
+      },
+      clearPinMigrations: { store.removeObject(forKey: migrationKey) },
       loadDefaultSessionSwipeAction: {
         store.string(forKey: swipeActionKey).flatMap(SessionSwipeAction.init(rawValue:)) ?? .default
       },
@@ -220,7 +253,10 @@ public extension PreferencesClient {
           }
           store.removeObject(forKey: ownedUpdateKey)
         }
-      }
+      },
+      loadOnboardingTipsDismissed: { store.bool(forKey: onboardingTipsDismissedKey) }, // unset → false
+      saveOnboardingTipsDismissed: { store.set($0, forKey: onboardingTipsDismissedKey) },
+      clearOnboardingTipsDismissed: { store.removeObject(forKey: onboardingTipsDismissedKey) }
     )
   }
 
@@ -229,6 +265,7 @@ public extension PreferencesClient {
     let box = LockIsolated<String?>(nil)
     let seen = LockIsolated<[String: Int]>([:])
     let pinned = LockIsolated<[String]>([])
+    let migrations = LockIsolated<[String: PinMigration]>([:])
     let swipeAction = LockIsolated<SessionSwipeAction>(.default)
     let selectedProfile = LockIsolated<String?>(nil)
     let pushToken = LockIsolated<String?>(nil)
@@ -239,6 +276,7 @@ public extension PreferencesClient {
     let liveActivity = LockIsolated(true)
     let liveActivityTitles = LockIsolated(true)
     let ownedUpdate = LockIsolated<OwnedAgentUpdate?>(nil)
+    let onboardingTipsDismissed = LockIsolated(false)
     return PreferencesClient(
       loadServerURL: { box.value },
       saveServerURL: { url in box.setValue(url) },
@@ -247,6 +285,9 @@ public extension PreferencesClient {
       saveSeenCounts: { seen.setValue($0) },
       loadPinnedIDs: { pinned.value },
       savePinnedIDs: { pinned.setValue($0) },
+      loadPinMigration: { migrations.value[$0] },
+      savePinMigration: { server, migration in migrations.withValue { $0[server] = migration } },
+      clearPinMigrations: { migrations.setValue([:]) },
       loadDefaultSessionSwipeAction: { swipeAction.value },
       saveDefaultSessionSwipeAction: { swipeAction.setValue($0) },
       loadSelectedProfileID: { selectedProfile.value },
@@ -285,7 +326,10 @@ public extension PreferencesClient {
         ownedUpdate.withValue { value in
           if actionID == nil || value?.actionID == actionID { value = nil }
         }
-      }
+      },
+      loadOnboardingTipsDismissed: { onboardingTipsDismissed.value },
+      saveOnboardingTipsDismissed: { onboardingTipsDismissed.setValue($0) },
+      clearOnboardingTipsDismissed: { onboardingTipsDismissed.setValue(false) }
     )
   }
 }

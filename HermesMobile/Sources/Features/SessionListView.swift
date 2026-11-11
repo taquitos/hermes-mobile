@@ -3,8 +3,9 @@ import HermesKit
 import SwiftUI
 
 /// The session list: searchable, pull-to-refresh, inbox-style cards sectioned by update date
-/// (Today, Yesterday, …). The top-trailing button opens the Archived sessions sheet. "New
-/// chat" lives in the bottom bar (alongside the iOS 26 bottom search field).
+/// (Today, Yesterday, …). The top-leading button opens the Archived sessions sheet; Search and
+/// the selected profile's Edit menu sit top-trailing. The tabs and New session live in the
+/// bottom bar (`HomeTabBar`).
 struct SessionListView: View {
   @Bindable var store: StoreOf<SessionListFeature>
   /// The session shown in the split view's detail column (#80), whose row gets the
@@ -16,8 +17,6 @@ struct SessionListView: View {
   /// .needsInputSessionIDs`, passed in by `AppView` like the highlight.
   var needsInputSessionIDs: Set<String> = []
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  /// Slides the selected-tab capsule between the bottom bar's tabs.
-  @Namespace private var tabSelection
   /// Keyboard focus for the search field, raised as soon as the field opens.
   @FocusState private var isSearchFieldFocused: Bool
 
@@ -29,7 +28,9 @@ struct SessionListView: View {
           .listRowSeparator(.hidden)
       }
       switch store.effectiveTab {
-      case .sessions:
+      // Under the Settings layer (`AppView`) the list keeps the Sessions rows: leaving Settings
+      // always lands on Sessions, so they come back with their scroll position intact.
+      case .sessions, .settings:
         if store.isSearching {
           // Search results are flat cards. A hit carries only id, snippet (as `preview`) and
           // start time: the untitled card promotes the snippet to its title, and the header
@@ -51,8 +52,9 @@ struct SessionListView: View {
     .environment(\.defaultMinListHeaderHeight, 0)
     .listSectionSpacing(0)
     .overlay {
-      if store.showsEmptyPlaceholder {
-        ContentUnavailableView("No sessions", systemImage: "bubble.left.and.bubble.right")
+      // Under the push card / tips the placeholder is a row instead (`showsInlineEmptyPlaceholder`).
+      if store.showsEmptyPlaceholder, !store.showsInlineEmptyPlaceholder {
+        emptyPlaceholder
       }
     }
     // Applied BEFORE the bottom `safeAreaInset` so the toast floats inside the list area,
@@ -75,8 +77,10 @@ struct SessionListView: View {
     .refreshable { store.send(.pulledToRefresh) }
     .toolbar {
       ToolbarItem(placement: .topBarLeading) {
-        Button("Settings", systemImage: "gearshape") {
-          store.send(.settingsButtonTapped)
+        Button {
+          store.send(.archivedButtonTapped)
+        } label: {
+          Label("Archived sessions", systemImage: "archivebox")
         }
       }
       if store.profilesSupported {
@@ -84,13 +88,8 @@ struct SessionListView: View {
           profilePill
         }
       }
-      // One trailing group, so iOS 26 draws Archive + Search in a single glass pill.
+      // One trailing group, so iOS 26 draws Search + Edit profile in a single glass pill.
       ToolbarItemGroup(placement: .topBarTrailing) {
-        Button {
-          store.send(.archivedButtonTapped)
-        } label: {
-          Label("Archived sessions", systemImage: "archivebox")
-        }
         if store.effectiveTab == .sessions {
           Button {
             store.send(.searchButtonTapped, animation: reduceMotion ? nil : .snappy)
@@ -98,12 +97,16 @@ struct SessionListView: View {
             Label("Search sessions", systemImage: "magnifyingglass")
           }
         }
+        if store.canEditSelectedProfile {
+          profileEditMenu
+        }
       }
     }
-    // The bottom bar: the Sessions | Cron Jobs tabs (only with cron content) and New chat.
-    // A `safeAreaInset` keeps it in the normal view hierarchy, above the home indicator.
+    // The bottom bar: the tab pill (Sessions, Cron Jobs with cron content, Settings) and New
+    // session. A `safeAreaInset` keeps it in the normal view hierarchy, above the home
+    // indicator.
     .safeAreaInset(edge: .bottom) {
-      bottomBar
+      HomeTabBar(store: store)
     }
     // `bottomActionSheet`, not `.confirmationDialog`: on iOS 26 the SwiftUI modifier
     // renders as a floating popover (dropping the title and Cancel) wherever it's
@@ -138,10 +141,6 @@ struct SessionListView: View {
     } message: {
       Text(ProfileName.hint)
     }
-    // No `NavigationStack` wrapper: `SettingsView` owns its stack (the `SettingsPath` pushes).
-    .sheet(item: $store.scope(state: \.settings, action: \.settings)) { settingsStore in
-      SettingsView(store: settingsStore)
-    }
     .sheet(item: $store.scope(state: \.archived, action: \.archived)) { archivedStore in
       NavigationStack {
         ArchivedSessionsView(store: archivedStore)
@@ -152,26 +151,31 @@ struct SessionListView: View {
         AddProfileView(store: addProfileStore)
       }
     }
-    // Push onboarding info sheet — raised by the reducer when the plugin isn't ready and the
-    // prompt isn't snoozed. Its two buttons send `SessionListFeature` actions.
-    .sheet(isPresented: $store.showPushSetupSheet) {
-      PushSetupGuideView(
-        // This sheet is only raised when the plugin isn't ready, so always show the install actions.
-        pluginInstalled: false,
-        onAskAgent: { store.send(.pushSetupAskAgentTapped) },
-        onLater: { store.send(.pushSetupLaterTapped) }
-      )
-    }
   }
 
-  /// The Sessions tab's non-search body: the "Sessions" header, the pinned section, then the
-  /// interactive sessions split into update-date sections (cron runs live in their own tab).
+  /// The Sessions tab's non-search body: the "Sessions" header, the push card, the tips row
+  /// and the inline "No sessions" placeholder, the pinned section, then the interactive
+  /// sessions split into update-date sections (cron runs live in their own tab).
   /// Extracted from `body` to keep the `List` builder within the compiler's type-check
   /// budget.
   @ViewBuilder
   private var sessionListContent: some View {
     // Top-level "Sessions" header, scoped to the active profile pill.
     tabTitleHeader("Sessions")
+    // The push card and the tips row (#136) lead the list, above Pinned and the date
+    // sections; never while searching. With no sessions the placeholder follows them as a row.
+    if store.showsPushCard, let card = store.pushCard {
+      pushCardRow(card)
+    }
+    if store.showsOnboardingTipsRow {
+      onboardingTipsRow
+    }
+    if store.showsInlineEmptyPlaceholder {
+      emptyPlaceholder
+        .padding(.top, 24)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+    }
     // Pinned sessions float to the top — as cards too, so the column never mixes card and
     // one-line geometry (desktop parity).
     if !store.pinnedSessions.isEmpty {
@@ -194,6 +198,40 @@ struct SessionListView: View {
         sectionHeader(section.label)
       }
     }
+  }
+
+  private var emptyPlaceholder: some View {
+    ContentUnavailableView("No sessions", systemImage: "bubble.left.and.bubble.right")
+  }
+
+  /// The push card as a plain list row: no separator, no row background (the card draws its
+  /// own surface), and the same 16pt side insets as the session cards below it.
+  private func pushCardRow(_ card: SessionListFeature.PushCard) -> some View {
+    let animation: Animation? = reduceMotion ? nil : .snappy
+    return PushCardView(
+      card: card,
+      askAgentButtonTapped: { store.send(.pushCardAskAgentButtonTapped) },
+      enableButtonTapped: { store.send(.pushCardEnableButtonTapped, animation: animation) },
+      notNowButtonTapped: { store.send(.pushCardNotNowButtonTapped, animation: animation) }
+    )
+    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 10, trailing: 16))
+    .listRowSeparator(.hidden)
+    .listRowBackground(Color.clear)
+  }
+
+  /// The tips row as a plain list row. Zero side insets: the row's own header and scroll
+  /// content margins supply the 16pt inset, so the paging cards run to the trailing edge.
+  private var onboardingTipsRow: some View {
+    OnboardingTipsView(
+      tips: store.onboardingTips,
+      swipeAction: store.effectiveSwipeAction,
+      hideButtonTapped: {
+        store.send(.onboardingTipsHideButtonTapped, animation: reduceMotion ? nil : .snappy)
+      }
+    )
+    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 10, trailing: 0))
+    .listRowSeparator(.hidden)
+    .listRowBackground(Color.clear)
   }
 
   /// A Pinned / date-section header: the title on the leading side and a hairline running to
@@ -221,75 +259,130 @@ struct SessionListView: View {
       .accessibilityAddTraits(.isHeader)
   }
 
-  /// The Cron Jobs tab. When the agent exposes `/api/cron/jobs` the rows are the *jobs*
-  /// (state dot, next-run countdown, unread dot), desktop-style: tapping a job expands a
-  /// single-open inline peek of its recent *runs* (the compact `cronRunRow(_:)` — a dense
-  /// tree surface keeps the one-liner, like the desktop); a context menu offers Run now /
-  /// Pause / Resume. Older agents (or before the first jobs fetch) fall back to the flat run
-  /// list. The tab's own badge carries the aggregate unread count.
+  /// The Cron Jobs tab. When the agent exposes `/api/cron/jobs` the rows are the *jobs* only
+  /// (state dot, status caption), desktop-style: tapping a job expands a single-open inline
+  /// list of its recent *runs*, loaded from `/runs` into `expandedCronRuns` — one timestamp
+  /// row per run (`cronJobRunRow(_:)`); a context menu offers Run now / Pause / Resume /
+  /// Delete. Only agents without the jobs API fall back to the flat run list.
   @ViewBuilder
   private var cronTabContent: some View {
     tabTitleHeader("Cron Jobs")
-    if store.cronJobGroups.isEmpty {
-      // Flat fallback: agent without the jobs API, or the jobs fetch hasn't landed yet.
+    if !store.cronJobsSupported {
+      // Flat fallback: agent without the jobs API.
       ForEach(store.cronSessions) { session in
         cronRunRow(session)
       }
     } else {
-      ForEach(store.cronJobGroups) { group in
-        cronJobRow(group)
-        if store.expandedCronJobID == group.id {
-          if group.runs.isEmpty {
-            Text("No runs yet")
-              .font(.subheadline)
-              .foregroundStyle(.secondary)
-              .padding(.leading, 24)
-              .listRowSeparator(.hidden)
-          }
-          ForEach(group.runs) { run in
-            cronRunRow(run)
-              .padding(.leading, 24) // indented under the owning job
-          }
+      ForEach(store.sortedCronJobs) { job in
+        cronJobRow(job)
+        if store.expandedCronJobID == job.id {
+          expandedCronRuns
         }
-      }
-      // Runs whose job no longer exists (deleted job, legacy id) — never hide output.
-      ForEach(store.unmatchedCronSessions) { session in
-        cronRunRow(session)
       }
     }
   }
 
-  /// One cron *job* row: state dot, title, next-run countdown (relative, from the same
-  /// `now` the row timestamps use — refreshed by the poll, no per-second ticker), unread
-  /// dot when any of the job's runs is unread, and a disclosure chevron for the peek.
-  private func cronJobRow(_ group: CronJobGroup) -> some View {
-    let isExpanded = store.expandedCronJobID == group.id
+  /// The expanded job's runs, indented under it: a spinner until the first `/runs` load
+  /// lands, "Couldn’t load runs" when it failed, "No runs yet" when empty, else one
+  /// timestamp row per run (a failed refresh keeps the last runs — reducer rule).
+  @ViewBuilder
+  private var expandedCronRuns: some View {
+    if let runs = store.expandedCronRuns {
+      if runs.isEmpty {
+        cronRunsPlaceholder("No runs yet")
+      }
+      ForEach(runs) { run in
+        cronJobRunRow(run)
+      }
+    } else if store.expandedCronRunsFailed {
+      cronRunsPlaceholder("Couldn’t load runs")
+    } else {
+      ProgressView()
+        .padding(.leading, Self.cronRunIndent)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .listRowSeparator(.hidden)
+    }
+  }
+
+  /// Leading indent that sets a job's runs under the job's title.
+  private static let cronRunIndent: CGFloat = 24
+
+  private func cronRunsPlaceholder(_ text: String) -> some View {
+    Text(text)
+      .font(.subheadline)
+      .foregroundStyle(.secondary)
+      .padding(.leading, Self.cronRunIndent)
+      .listRowSeparator(.hidden)
+  }
+
+  /// One run under an expanded job: only its timestamp, like the desktop (sibling runs share
+  /// the job's title). A session run opens its chat on tap (unread dot while it has unseen
+  /// activity) — tap only, no swipe or context menu. A script-only `cron_output` run has no
+  /// session behind it, so it is plain secondary text.
+  @ViewBuilder
+  private func cronJobRunRow(_ run: Session) -> some View {
+    let label = CronJob.runTimestampLabel(
+      for: run.updatedAt ?? run.startedAt, timeZone: store.calendar.timeZone
+    )
+    if run.isCron {
+      let isUnread = store.unreadSessionIDs.contains(run.id)
+      Button {
+        store.send(.cronRunTapped(id: run.id))
+      } label: {
+        HStack(spacing: 8) {
+          if isUnread {
+            Circle().fill(Color.hermesAccent).frame(width: 8, height: 8)
+          }
+          Text(label)
+            .font(.subheadline)
+            .fontWeight(isUnread ? .semibold : .regular)
+            .monospacedDigit()
+          Spacer(minLength: 0)
+        }
+        .padding(.leading, Self.cronRunIndent)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .listRowSeparator(.hidden)
+      .listRowBackground(run.id == highlightedSessionID ? SelectedRowBackground() : nil)
+      .accessibilityLabel(isUnread ? "Run \(label), unread" : "Run \(label)")
+      .accessibilityAddTraits(run.id == highlightedSessionID ? [.isSelected] : [])
+    } else {
+      Text(label)
+        .font(.subheadline)
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .padding(.leading, Self.cronRunIndent)
+        .listRowSeparator(.hidden)
+        .accessibilityLabel("Script run \(label)")
+    }
+  }
+
+  /// One cron *job* row: state dot, title, the status caption (`CronJob.statusCaption` —
+  /// the state in words, or the next-run countdown from the same `now` the row timestamps
+  /// use, refreshed by the poll with no per-second ticker; overdue tinted orange), and a
+  /// disclosure chevron for the runs.
+  private func cronJobRow(_ job: CronJob) -> some View {
+    let isExpanded = store.expandedCronJobID == job.id
+    let caption = job.statusCaption(now: store.now)
     return Button {
-      store.send(.cronJobTapped(id: group.id), animation: reduceMotion ? nil : .snappy)
+      store.send(.cronJobTapped(id: job.id), animation: reduceMotion ? nil : .snappy)
     } label: {
       HStack(spacing: 10) {
         Circle()
-          .fill(cronStateColor(group.job.effectiveState))
+          .fill(cronStateColor(job.effectiveState))
           .frame(width: 8, height: 8)
         VStack(alignment: .leading, spacing: 2) {
-          Text(group.job.title)
-            .fontWeight(group.hasUnread ? .semibold : .regular)
+          Text(job.title)
             .lineLimit(1)
-          if let next = group.job.nextRunAt {
-            Text("Next \(CronJob.relativeRunLabel(for: next, now: store.now))")
+          if let caption {
+            Text(caption.text)
               .font(.caption)
-              .foregroundStyle(.secondary)
-          } else if let schedule = group.job.scheduleDisplay {
-            Text(schedule)
-              .font(.caption)
-              .foregroundStyle(.secondary)
+              .foregroundStyle(caption.isOverdue ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
               .lineLimit(1)
           }
         }
         Spacer()
-        if group.hasUnread {
-          Circle().fill(Color.hermesAccent).frame(width: 8, height: 8)
-        }
         Image(systemName: "chevron.right")
           .font(.caption.weight(.semibold))
           .foregroundStyle(.tertiary)
@@ -299,19 +392,24 @@ struct SessionListView: View {
     }
     .buttonStyle(.plain)
     .listRowSeparator(.hidden)
-    .accessibilityLabel(cronJobAccessibilityLabel(group, isExpanded: isExpanded))
+    .accessibilityLabel(cronJobAccessibilityLabel(job, caption: caption?.text, isExpanded: isExpanded))
     .contextMenu {
       Button("Run now", systemImage: "play") {
-        store.send(.triggerCronJob(id: group.id))
+        store.send(.triggerCronJob(id: job.id))
       }
-      if group.job.isPaused {
+      if job.isPaused {
         Button("Resume", systemImage: "play.circle") {
-          store.send(.resumeCronJob(id: group.id))
+          store.send(.resumeCronJob(id: job.id))
         }
       } else {
         Button("Pause", systemImage: "pause.circle") {
-          store.send(.pauseCronJob(id: group.id))
+          store.send(.pauseCronJob(id: job.id))
         }
+      }
+      Divider()
+      // Confirmed through the reducer's dialog (`.bottomActionSheet`), never sent directly.
+      Button("Delete", systemImage: "trash", role: .destructive) {
+        store.send(.deleteCronJobTapped(id: job.id))
       }
     }
   }
@@ -329,13 +427,11 @@ struct SessionListView: View {
     }
   }
 
-  private func cronJobAccessibilityLabel(_ group: CronJobGroup, isExpanded: Bool) -> String {
-    var parts = [group.job.title]
-    if group.job.isPaused { parts.append("paused") }
-    if let next = group.job.nextRunAt {
-      parts.append("next run \(CronJob.relativeRunLabel(for: next, now: store.now))")
-    }
-    if group.hasUnread { parts.append("unread runs") }
+  /// Title, the visible status caption ("Paused", "Next in 1 hr.", "Overdue · 2 hr. ago" —
+  /// so the state word is announced), and the disclosure state.
+  private func cronJobAccessibilityLabel(_ job: CronJob, caption: String?, isExpanded: Bool) -> String {
+    var parts = [job.title]
+    if let caption { parts.append(caption) }
     parts.append(isExpanded ? "expanded" : "collapsed")
     return parts.joined(separator: ", ")
   }
@@ -344,8 +440,8 @@ struct SessionListView: View {
 
   /// Safari-style centered pill in the navigation bar: the active profile's icon (a house
   /// for the default profile; none for custom ones), its name, and a chevron. Tapping it
-  /// opens the profile `Menu`. Rendered only when the agent supports profiles
-  /// (`profilesSupported`); otherwise the static "Sessions" title is shown instead.
+  /// opens the profile `Menu`, where ONE tap on any profile switches to it. Rendered only
+  /// when the agent supports profiles (`profilesSupported`).
   private var profilePill: some View {
     Menu {
       profileMenuContent
@@ -370,39 +466,17 @@ struct SessionListView: View {
     .accessibilityLabel("Profile: \(store.selectedProfileName)")
   }
 
-  /// The profile `Menu`'s contents: each profile (checkmark on the active one; custom
-  /// profiles offer rename/delete in a nested menu), a divider, then "Add profile".
+  /// The profile `Menu`'s contents: every profile as a plain button — ONE tap selects it — a
+  /// divider, then "Add profile". No checkmarks (Safari-style): the default profile shows a
+  /// house, custom ones a person glyph, and the pill title names the active one. Rename and
+  /// Delete live in the trailing Edit menu (`profileEditMenu`), for the selected profile only.
   @ViewBuilder
   private var profileMenuContent: some View {
     ForEach(store.profiles) { profile in
-      if profile.isDefault {
-        Button {
-          store.send(.selectProfile(name: profile.name))
-        } label: {
-          Label(profile.name, systemImage: "house")
-        }
-      } else {
-        // Custom profiles: select on tap, with a nested menu for rename/delete.
-        Menu {
-          Button {
-            store.send(.selectProfile(name: profile.name))
-          } label: {
-            Label("Switch to this profile", systemImage: "arrow.right.circle")
-          }
-          Divider()
-          Button {
-            store.send(.renameProfileTapped(name: profile.name))
-          } label: {
-            Label("Rename", systemImage: "pencil")
-          }
-          Button(role: .destructive) {
-            store.send(.deleteProfileButtonTapped(name: profile.name))
-          } label: {
-            Label("Delete", systemImage: "trash")
-          }
-        } label: {
-          Label(profile.name, systemImage: "person.crop.circle")
-        }
+      Button {
+        store.send(.selectProfile(name: profile.name))
+      } label: {
+        Label(profile.name, systemImage: profile.isDefault ? "house" : "person.crop.circle")
       }
     }
 
@@ -415,43 +489,30 @@ struct SessionListView: View {
     }
   }
 
+  /// The trailing pencil: Rename / Delete for the SELECTED custom profile. Shown only while
+  /// `canEditSelectedProfile` (never for the default profile). Both go through the reducer —
+  /// the rename alert and the `.bottomActionSheet` delete confirmation.
+  private var profileEditMenu: some View {
+    Menu {
+      Button {
+        store.send(.renameProfileTapped(name: store.selectedProfileName))
+      } label: {
+        Label("Rename profile", systemImage: "pencil")
+      }
+      Button(role: .destructive) {
+        store.send(.deleteProfileButtonTapped(name: store.selectedProfileName))
+      } label: {
+        Label("Delete profile", systemImage: "trash")
+      }
+    } label: {
+      Label("Edit profile", systemImage: "pencil")
+    }
+  }
+
   private var isSelectedDefault: Bool {
     store.profiles[id: store.selectedProfileName]?.isDefault
       ?? (store.selectedProfileName == SessionListFeature.State.defaultProfileName)
   }
-
-  /// The bottom "new session" button — a trailing circular FAB in the Hermes accent
-  /// (icon-only: it starts a new session, not a chat). Rendered via `safeAreaInset` so the
-  /// list content scrolls clear of it.
-  /// The bottom bar: a glass Sessions | Cron Jobs tab pill on the leading side (only while
-  /// there is cron content — `showsTabBar`) and the round glass New chat button trailing.
-  private var bottomBar: some View {
-    HStack(alignment: .center) {
-      if store.showsTabBar {
-        tabPill
-      }
-      Spacer(minLength: 0)
-      Button {
-        store.send(.newSessionButtonTapped)
-      } label: {
-        Image(systemName: "square.and.pencil")
-          .font(.title2.weight(.semibold))
-          .foregroundStyle(.primary)
-          .frame(width: Self.barHeight, height: Self.barHeight)
-          .contentShape(Circle())
-          .modifier(GlassBackground(
-            shape: Circle(), isInteractive: true, fallbackShadowRadius: 6, fallbackShadowY: 3
-          ))
-      }
-      .buttonStyle(.plain)
-      .accessibilityLabel("New session")
-    }
-    .padding(.horizontal)
-    .padding(.vertical, 8)
-  }
-
-  /// The bar's shared height: the tab pill and the New chat circle line up.
-  private static let barHeight: CGFloat = 64
 
   /// The open search field in place of the nav bar row: a glass capsule field (focused on
   /// open) beside a round glass close button that hides it and clears the query.
@@ -491,70 +552,6 @@ struct SessionListView: View {
 
   private static let searchBarHeight: CGFloat = 48
 
-  private var tabPill: some View {
-    HStack(spacing: 0) {
-      tabButton(.sessions, title: "Sessions", systemImage: "text.bubble.fill")
-      tabButton(.cron, title: "Cron Jobs", systemImage: "clock.fill", badge: store.cronUnreadCount)
-    }
-    .padding(4)
-    .frame(height: Self.barHeight)
-    .modifier(GlassBackground(shape: Capsule(), fallbackShadowRadius: 6, fallbackShadowY: 3))
-  }
-
-  /// One tab: icon over label, the selected one on an inner capsule in the accent color. The
-  /// Cron Jobs tab carries the aggregate unread-run badge (the desktop's `CRON JOBS 4`).
-  private func tabButton(
-    _ tab: SessionListTab,
-    title: String,
-    systemImage: String,
-    badge: Int = 0
-  ) -> some View {
-    let isSelected = store.effectiveTab == tab
-    return Button {
-      store.send(.selectTab(tab), animation: reduceMotion ? nil : .snappy)
-    } label: {
-      VStack(spacing: 2) {
-        Image(systemName: systemImage)
-          .font(.title3)
-          .overlay(alignment: .topTrailing) {
-            if badge > 0 {
-              Text("\(badge)")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .background(Color.hermesAccent, in: Capsule())
-                .offset(x: 12, y: -6)
-            }
-          }
-        Text(title)
-          .font(.caption.weight(.semibold))
-      }
-      .foregroundStyle(isSelected ? Color.hermesAccent : Color.primary)
-      .padding(.horizontal, 18)
-      .frame(maxHeight: .infinity)
-      .background {
-        if isSelected {
-          Capsule()
-            .fill(Color(.systemBackground).opacity(0.55))
-            .matchedGeometryEffect(id: "selectedTab", in: tabSelection)
-        }
-      }
-      .contentShape(Capsule())
-    }
-    .buttonStyle(.plain)
-    .accessibilityLabel(tabAccessibilityLabel(title: title, badge: badge))
-    .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-  }
-
-  private func tabAccessibilityLabel(title: String, badge: Int) -> String {
-    switch badge {
-    case 0: title
-    case 1: "\(title), 1 unread cron run"
-    default: "\(title), \(badge) unread cron runs"
-    }
-  }
-
   /// Stemmed-entry convenience: renders a lane's `SessionBranchEntry` — the card with the
   /// branch elbow stem (`└─`/`├─`) in its header and a leading indent when nested.
   private func row(_ entry: SessionBranchEntry) -> some View {
@@ -587,8 +584,8 @@ struct SessionListView: View {
     .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
   }
 
-  /// A cron run (job peek, flat fallback, unmatched runs) as the compact one-line row — a
-  /// dense tree surface, like the desktop's cron section. Same affordances as a card.
+  /// A cron run in the flat fallback (agents without the jobs API) as the compact one-line
+  /// row. Same affordances as a card.
   private func cronRunRow(_ session: Session) -> some View {
     sessionRow(session) { isPinned in
       SessionRowView(
@@ -702,13 +699,16 @@ struct SessionListView: View {
   private func pinButton(_ session: Session, isPinned: Bool) -> some View {
     // Animate the send so the row glides between its date section and the Pinned
     // section (and the section itself fades in/out) instead of jumping.
-    if isPinned {
-      Button("Unpin", systemImage: "pin.slash") {
-        store.send(.unpinSession(id: session.id), animation: .snappy)
-      }
-    } else {
-      Button("Pin", systemImage: "pin") {
-        store.send(.pinSession(id: session.id), animation: .snappy)
+    // Use the reducer's ownership and operation checks, not just search visibility.
+    if store.state.canChangePin(id: session.id) {
+      if isPinned {
+        Button("Unpin", systemImage: "pin.slash") {
+          store.send(.unpinSession(id: session.id), animation: .snappy)
+        }
+      } else {
+        Button("Pin", systemImage: "pin") {
+          store.send(.pinSession(id: session.id), animation: .snappy)
+        }
       }
     }
   }

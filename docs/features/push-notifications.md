@@ -32,8 +32,14 @@ Push notifications span THREE artifacts but only the iOS app lives in this repo:
   `$(APS_ENVIRONMENT)` (Debug → `development`, Release → `production`) in `Project.swift`, NOT a
   static value (Tuist emits the entitlement verbatim with no Xcode export rewrite, so a static
   `development` would ship a sandbox entitlement on Release).
-- **Permission is requested on the sessions-list appearance** (right after login), per the
-  product decision — NOT first launch.
+- **During onboarding, the system asks for permission when the user taps "Turn on" on the
+  session list's push card (#136).** When the list appears, `setupPush` probes the plugin.
+  If the plugin is ready, it checks permission, registers silently if already granted,
+  offers "Turn on" if permission has never been requested, and hides the card if denied.
+  If the plugin is missing or disabled, it offers "Ask my agent to install it". Both cards
+  share the same Fibonacci snooze. Users can also turn on notifications in Settings, where
+  they can open `PushSetupGuideView`. See "After sign-in: the push card" in
+  `docs/features/onboarding.md`.
 - **Test delivery requires a positive result** from `POST /api/plugins/hermes-push/test`.
   HTTP 200 alone is not success: no registered devices, missing delivery results, or a failure
   for every device displays an error in Settings. One accepted device is enough when other

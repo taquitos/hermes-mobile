@@ -34,8 +34,8 @@ bullets below are the compressed rules.
   `-32601` (`GatewayError.isUnknownMethod`) or REST 404 (405 where an older agent's catch-all
   matches) flips a `*Supported` flag off (attach, profiles, cron jobs, push, slash commands,
   TTS); `?? true` on unknown capability fields. Mirror the desktop's behaviour where one
-  exists; check the Hermes source. (#19's OAuth segment deliberately inverts `?? true` — see
-  the OAuth bullet below.)
+  exists; check the Hermes source. (#19's OAuth provider buttons deliberately invert `?? true`
+  — see the OAuth bullet below.)
 - **Surface RPC failures** (set `errorBanner`, clear `isSending`/`activity`) — never
   swallow them with `try?` (the logout hops, below, and the debug-log-only #98 replay read
   and Settings `/api/status` probe are the carved-out exceptions).
@@ -109,7 +109,7 @@ bullets below are the compressed rules.
   `?ticket=` minted per connect — never cached, and `.cookie`/`.bearer` SHARE the `connect`
   branch so the cancellation choreography can't drift; a 401 mint → `.sessionExpired` →
   `ReauthFeature` with identity-aware routing (same user reconnects; different user pops +
-  clears identity-scoped prefs). The Password | Token | \<provider\> toggle is capability-gated.
+  clears identity-scoped prefs). Onboarding's Sign in layout is derived from the capability.
   Full protocol: `docs/architecture.md`.
 - **`RequestAuth` is the ONE place either auth header is written**, and **every bearer read
   goes through `BearerTokenStore.validAccessToken()`** — the store owns the token pair and is
@@ -119,19 +119,26 @@ bullets below are the compressed rules.
   `bearerTokens.clear(claim:)`; `detachPersistence()` BEFORE every `keychain.deleteSession()`.
   `rest.logout` is the one deliberate never-swallow exception. Details:
   `docs/features/oauth-sign-in.md`.
-- **The OAuth segment needs positive evidence, not `?? true`**: an OAuth provider AND
-  `native_pkce` in `auth_flows`, else hidden. `isGated` is deliberately NOT a bare
-  `authRequired == true`. Loopback-only redirect (`ASWebAuthenticationSession` + in-app
+- **An OAuth provider button needs positive evidence, not `?? true`**: an OAuth provider AND
+  `native_pkce` in `auth_flows`, else hidden. A gated server with no providers is
+  `.tokenOnly` (token layout). Loopback-only redirect (`ASWebAuthenticationSession` + in-app
   `NWListener`), no WKWebView fallback, plain-text provider labels (App Store 5.2.1).
   Details: `docs/features/oauth-sign-in.md`.
+- **Onboarding is a `ConnectionPath` stack (#136)**: Welcome (root, no reducer) → `ServerStep`
+  → `SignInStep`, parented by `ConnectionFeature`; `.connected` goes up unchanged. Sign in exists
+  only with a `ServerProbe` and connects to the URL that answered (the `:9119` fallback is what's
+  saved); popping it cancels its effects (that abandons OAuth). Probe failures are a typed
+  `ProbeFailure` from `probeStatus` — never widen `RESTError`. Local Network gets a card hint
+  line, no explainer or detection (TN3179). Details: `docs/features/onboarding.md`.
 - **Login help**: the `AgentSetupGuideView` sheet is the single connection-help surface
-  (four entry points toggle one local `@State`; presentation stays out of the reducer).
-  Keep the README quick-start and the sheet's commands verbatim-identical.
-- **Launch auto-connect failure that isn't a credentials verdict raises the retry
-  screen, never onboarding (#62)**: only 401/403 falls back to prefilled onboarding;
-  everything else (incl. `RESTError.offline`) populates `connectionFailed`.
-  `ConnectionFailedFeature.isRetryable` is the ONE routing rule. Launch path only;
-  a foreground re-probe supersedes an in-flight one.
+  (Welcome, the Server step, each failure card, the retry screen — view-local `@State`, never
+  reducer state). Keep the README quick-start (incl. the Hermes Cloud copy) and the sheet
+  verbatim-identical.
+- **Launch auto-connect failure that isn't a credentials verdict raises the retry screen,
+  never onboarding (#62)**: only 401/403 falls back to onboarding (`State(recovering:token:)`:
+  auto-probing Server step, token prefilled); everything else (incl. `RESTError.offline`)
+  populates `connectionFailed`. `ConnectionFailedFeature.isRetryable` is the ONE routing
+  rule. Launch path only; a foreground re-probe supersedes an in-flight one.
 
 ## Transcript & chat UI
 
@@ -192,7 +199,8 @@ bullets below are the compressed rules.
   `.status(kind: "notice")` lines, never bubbles; `hidden` / `model_only` rows are dropped.
   Same rule for a running turn's `inflight.display_kind`. Details: `docs/architecture.md`.
 - **Message actions & branching (#34)**: copy via the shared
-  `copyWithFeedback`/`rowCopyToken` mechanism; branch is a seeded `session.create`
+  `copyWithFeedback`/`rowCopyToken` mechanism; branch is a seeded `session.create` (on a
+  session-authority host, a fenced `session.mutate` branch that opens by stored id, no seed)
   guarded by strict `canBranch` gates with a client-held `BranchSeed` recovery protocol
   (probe-before-seed-replay; no probe budget). The trickiest state machine in the app —
   read `docs/features/message-actions-and-branching.md` before touching it.
@@ -206,6 +214,9 @@ bullets below are the compressed rules.
   per-socket `client.capabilities` advertisement settles (5 s cap, no retry); its `-32601` is
   NOT a `*Supported` verdict (`docs/architecture.md`). Queue, replay, decline matrix, clarify
   forms, layout, push-tap recovery: `docs/features/approvals.md`.
+- **Approval mode is profile-wide**, gated on desktop contract ≥3: reconcile through
+  profile-scoped config reads, preserve absent session-info values, and allow one write
+  at a time. Details in `docs/features/approval-mode.md`.
 - **Context-usage pill**: display derives from `Usage` helpers in HermesKit (thresholds
   mirror the Hermes TUI, unit-tested); severity→color and popover are local `@State`.
 - **File references are tappable in place** — `MarkdownText.inline` attaches
@@ -241,7 +252,11 @@ bullets below are the compressed rules.
 - **Mid-turn prompt queuing is client-side (#66)** — never submit against a running
   turn. Everything funnels through `submitDraft` + `drainQueueIfReady`; Stop and turn
   `.error` park the queue; a failed drain re-parks at head (never silently lost, never
-  shown twice); queue is in-memory only. Details: `docs/features/prompt-queue.md`.
+  shown twice); queue is in-memory only. Carve-out: Steer now sends a queued entry with
+  `session.steer` (never `prompt.submit`); it stays queued under `steeringEntryID`, which
+  holds the drain, and leaves only on `status == "queued"` (or a hydrate proving a lost accept
+  delivered it). Details:
+  `docs/features/prompt-queue.md`.
 - **The `model · effort` chip is the only picker (#81)** — `config.set` inside the #17 heal,
   optimistic then reconciled by `session.info`. Offer the FULL reasoning ladder always (the
   server clamps per provider and publishes no per-model list); a failure rolls back BOTH keys
@@ -265,12 +280,14 @@ bullets below are the compressed rules.
 - **`ChatSnapshotClient` (GRDB) is a NON-AUTHORITATIVE cache** — instant paint + turn
   anchor only; server wins on hydrate, persistence debounced (flushed on
   `.background`), wiped on logout; behind the client boundary (no reactive `@FetchAll`).
-- **Persistence**: secrets → `KeychainClient`; non-secret prefs (URL, seen counts,
-  pins, swipe default, read-aloud toggle, profile, model-picker favorites/collapsed
-  providers) → `PreferencesClient`. Clients over `@Shared` for test isolation; both have
-  `.inMemory()`. **Logout must clear every prefs entry.**
-- **Pins are device-local; archive, rename, and delete are server-side**, optimistic
-  with rollback (list → REST `PATCH`/`DELETE`; chat rename → `session.title`).
+- **Persistence**: secrets → `KeychainClient`; non-secret prefs (URL, seen counts, pins,
+  swipe default, read-aloud toggle, profile, model-picker favorites/collapsed providers,
+  push-card snooze, tips dismissal) → `PreferencesClient`. Clients over `@Shared` for test
+  isolation; both have `.inMemory()`. **Logout must clear every prefs entry.**
+- **Pin membership syncs with the server; pin order stays device-local.** Details in
+  `docs/features/session-list.md`.
+- **Archive, rename, and delete are server-side**, optimistic with rollback (list → REST
+  `PATCH`/`DELETE`; chat rename → `session.title`).
 - **Delete (#73) mirrors archive** (`deletingIDs` guard, rollback) with a
   `deleteSupported` flip on 404 **or 405** (older agents serve the path for
   `PATCH`/`GET`) — silent, mirrored both ways with the archived sheet; the swipe-default
@@ -286,13 +303,12 @@ bullets below are the compressed rules.
 - **Chat ⋯ menu Archive/Delete**: rules in `docs/features/session-list.md`.
 - **Date sections, inbox cards, cron jobs, and branch nesting are display-only** over one
   array fetched as TWO source slices (interactive + cron, never one shared page — cron runs
-  starve it): always-on update-date sections via pure `SessionDateBucket` /
-  `groupEntriesByDate` (no grouping pref); `SessionCardView` on every interactive row,
-  compact `SessionRowView` only for cron runs + the archived sheet; cron sessions sit in
-  a job-grouped Cron Jobs TAB (bottom-bar pill only with cron content; views read
-  `effectiveTab`; unread badge on the tab; search is Sessions-only, opened from the toolbar);
-  nesting via pure `flattenSessionsWithBranches` (orphans de-nest; search stays flat).
-  Details: `docs/features/session-list.md`.
+  starve it): update-date sections via pure `SessionDateBucket` / `groupEntriesByDate`;
+  `SessionCardView` on every interactive row, compact `SessionRowView` only for the flat cron
+  fallback + archived sheet; the Cron Jobs TAB lists jobs (tab only with cron content; views
+  read `effectiveTab`; no badge; search is Sessions-only). **Never group cron runs by session
+  id** — an expanded job's runs come from `/runs` (its 404 flips no flag). Nesting via
+  pure `flattenSessionsWithBranches` (orphans de-nest). Details: `docs/features/session-list.md`.
 - **Row affordances**: trailing swipe = destructive default FIRST (full-swipe target),
   then Rename; context menu always offers both Archive and Delete (gated); Copy ID
   context-menu-only; rows are natural-height — NO min-height floor (a floor for
@@ -314,14 +330,17 @@ bullets below are the compressed rules.
   duplicated per feature. Attach the overlay where nothing can swallow it (before a
   bottom `.safeAreaInset`; on the transcript, not the outer `VStack`); announce every
   copy to VoiceOver off the token.
-- **Settings is ONE `Form` (six groups) + a `SettingsPath` stack** owned by `SettingsView`
-  (the sheet adds no `NavigationStack`); rows push by reducer append, never `NavigationLink`.
+- **Settings is a home TAB: ONE `Form` (six groups) + a `SettingsPath` stack** owned by
+  `SettingsView`, layered over the WHOLE split view in `AppView` (never inside a column — that
+  nests stacks); state seeded on select, dropped on leave (`closeSettingsTab()`); every chat
+  route (push tap, intent, open, new session) leaves the tab. Rows
+  push by reducer append, never `NavigationLink`.
   App icons: every set is an alternate in `Project.swift` (primary included — it differs
   per build); `AppIconCatalog.parse` filters the primary, which is always `set(nil)`; iOS
   persists the choice, logout never touches it. `DiagnosticsReport` takes no `AuthSession`
   (no-secrets invariant). Gates, icon table, links: `docs/features/settings.md`.
 - **The agent updater (Settings → Server, under Agent) POSTs `/api/hermes/update` at most
-  once per confirmation and never retries it**; a send-side failure is `.uncertain`. Only a
+  once per confirmation and never retries it**; a send-side failure or 5xx is `.uncertain`. Only a
   finished receipt proven to be this phone's run (its action id) reports success; a
   reconnect never does. Contract: `docs/features/agent-update.md`.
 
@@ -331,8 +350,9 @@ bullets below are the compressed rules.
   repos). Non-negotiables: capability-gate on the plugin `/register` 404; the
   **generic-body privacy rule** (no content/args/command in a push, ever); `apns_env`
   must match the per-configuration `$(APS_ENVIRONMENT)` entitlement; the app and plugin
-  hold no push secret (gateway-issued device-scoped capability); permission requested
-  on sessions-list appearance. Repos, capability scheme, the four trigger hooks,
+  hold no push secret (gateway-issued device-scoped capability); the permission prompt fires
+  only from the session list's Turn on card, never on appearance (#136,
+  `docs/features/onboarding.md`). Repos, capability scheme, the four trigger hooks,
   cold-launch tap replay (#46), and fork filtering (#64):
   `docs/features/push-notifications.md`.
 - **Push-tap routing dedups against the slot (#32)** under `isChatDetached`: matches slot
@@ -389,7 +409,7 @@ bullets below are the compressed rules.
   (assert `contentSize` vs `bounds`, hosted `sizeThatFits`) — see
   `MarkdownTableLayoutTests.swift` and `ApprovalCardLayoutTests.swift`. Pin
   `.dynamicTypeSize(.large)`, and vary it where a `@ScaledMetric` cap is under test.
-- **`make snapshot` is clean** (364/364), so any failure is a real signal. A view change
+- **`make snapshot` is clean** (406/406), so any failure is a real signal. A view change
   re-records its own baselines in the same PR. If a future runtime drifts, judge by size
   first: differing render size = regression; equal size with small pixel residual = drift,
   re-recorded in its own commit. Details: `docs/development.md`.

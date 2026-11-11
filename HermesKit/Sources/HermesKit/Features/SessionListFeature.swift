@@ -1,29 +1,23 @@
 import ComposableArchitecture
 import Foundation
 
-/// A cron job with its run-history sessions — one row of the grouped Cron Jobs tab.
-/// Built by `SessionListFeature.State.cronJobGroups`.
-public struct CronJobGroup: Equatable, Sendable, Identifiable {
-  public var job: CronJob
-  /// The job's most recent runs (newest first), capped to `State.cronPeekLimit`.
-  public var runs: [Session]
-  /// Whether ANY of the job's runs (capped or not) is unread — drives the job row's dot.
-  public var hasUnread: Bool
-
-  public var id: String { job.id }
-
-  public init(job: CronJob, runs: [Session], hasUnread: Bool = false) {
-    self.job = job
-    self.runs = runs
-    self.hasUnread = hasUnread
-  }
-}
-
 /// Lists Hermes sessions for the connected server and supports full-text search.
 /// Tapping a row or the "+" button emits a delegate the parent uses to open chat
 /// (resume) or start a new session — `ChatFeature` wiring lands in Task 8.
 @Reducer
 public struct SessionListFeature {
+  public struct PinMutation: Equatable, Sendable {
+    public var pinned: Bool
+    public var previousIndex: Int?
+    public var profileName: String
+
+    public init(pinned: Bool, previousIndex: Int?, profileName: String) {
+      self.pinned = pinned
+      self.previousIndex = previousIndex
+      self.profileName = profileName
+    }
+  }
+
   @ObservableState
   public struct State: Equatable {
     public var connection: ServerConnection
@@ -51,6 +45,8 @@ public struct SessionListFeature {
     public var seenCounts: [String: Int]
     /// Pinned session ids (persisted), order = display order in the top "Pinned" section.
     public var pinnedIDs: [String]
+    /// Profile pin writes in flight, guarding duplicate pin changes for the same ID.
+    public var pinMutations: [String: PinMutation] = [:]
     /// Ids whose archive PATCH is currently IN FLIGHT. Transient: an id is added when its
     /// PATCH starts and removed on BOTH success and failure. While an id is here, a list/search
     /// response that lands during the in-flight window filters it out (suppressing a stale row),
@@ -74,7 +70,8 @@ public struct SessionListFeature {
     /// this to `.archive` while the agent lacks the DELETE capability.
     public var defaultSwipeAction: SessionSwipeAction
     /// The bottom bar's selected tab. In-memory only (a launch starts on Sessions); views
-    /// read `effectiveTab`, which falls back to Sessions while there is no cron content.
+    /// read `effectiveTab`, which falls back to Sessions while there is no cron content (or,
+    /// for Settings, no seeded `settings` state).
     public var selectedTab: SessionListTab
     /// Whether the Sessions tab's search field is open — opened from the toolbar's search
     /// button, it replaces the nav bar row; closing clears the query.
@@ -105,13 +102,19 @@ public struct SessionListFeature {
     /// (plugin not installed). Threaded into Settings so the notifications UI is capability-gated.
     /// Defaults to `true` (optimistic) so we attempt registration before the first probe.
     public var pushAvailable: Bool
-    /// Whether the push info sheet is presented. Raised when the plugin is not ready and the
-    /// prompt isn't currently snoozed; dismissed by either of the sheet's two buttons. Pure
-    /// presentation state (a `Bool`) — the sheet's buttons send `SessionListFeature` actions.
-    public var showPushSetupSheet: Bool
-    /// Cron jobs fetched from `GET /api/cron/jobs` — the grouping spine of the Cron Jobs
-    /// section. Empty until the first fetch lands (the section falls back to the flat run
-    /// list meanwhile).
+    /// The inline push card at the top of the Sessions tab, or `nil` for none. Set by
+    /// `setupPush`'s verdict: the plugin is ready but notification permission was never asked
+    /// → `.enableNotifications`; the plugin is not ready → `.installPlugin` — each only while
+    /// the prompt isn't snoozed. Every card button clears it. The system permission prompt
+    /// fires only from the card's Turn on button, never on list appearance.
+    public var pushCard: SessionListFeature.PushCard?
+    /// Whether the dismissible tips row (#136) is on: `true` until the user taps Hide, which
+    /// persists `onboardingTipsDismissed` (cleared on logout, so the next sign-in shows them
+    /// again). Seeded from the pref when the list is built and re-read with the other prefs.
+    /// Views read `showsOnboardingTipsRow`, which also hides it while searching / on Cron Jobs.
+    public var showsOnboardingTips: Bool
+    /// Cron jobs fetched from `GET /api/cron/jobs` — the Cron Jobs tab's rows. Empty until
+    /// the first fetch lands.
     public var cronJobs: IdentifiedArrayOf<CronJob>
     /// Whether the agent exposes `/api/cron/jobs` (set false on a definitive 404 — older
     /// agent). When false the section renders today's flat cron-session rows and the jobs
@@ -120,8 +123,17 @@ public struct SessionListFeature {
     /// The job whose inline run-peek is expanded — single-open so the section stays
     /// scannable (mirrors the desktop sidebar's peek).
     public var expandedCronJobID: String?
-    /// Job ids whose trigger/pause/resume RPC is IN FLIGHT. Transient double-fire guard
-    /// (mirrors `archivingIDs`): added when the POST starts, removed on success/failure.
+    /// The expanded job's recent runs, fetched from `GET /api/cron/jobs/{id}/runs` (newest
+    /// first, capped to `cronPeekLimit`): session rows (`isCron`, open a chat) plus
+    /// script-only `cron_output` rows (plain text). `nil` = not loaded yet (spinner), `[]` =
+    /// "No runs yet". One slot for the ONE expanded job — cleared whenever the expansion
+    /// changes, so a run list never shows under the wrong job.
+    public var expandedCronRuns: [Session]?
+    /// The expanded job's FIRST runs load failed ("Couldn't load runs"). A failed refresh
+    /// keeps the runs already shown and leaves this false.
+    public var expandedCronRunsFailed: Bool
+    /// Job ids whose trigger/pause/resume/delete request is IN FLIGHT. Transient double-fire
+    /// guard (mirrors `archivingIDs`): added when the request starts, removed on success/failure.
     public var cronActionInFlightIDs: Set<String>
     /// Non-`nil` while the transient "Session ID copied" toast is showing. Purely transient
     /// confirmation state: raised by a copy, cleared by the timed expiry. It's a counter
@@ -129,6 +141,10 @@ public struct SessionListFeature {
     /// observable change — that's what re-announces the copy to VoiceOver (a `Bool` would
     /// stay `true` and the announcement would be swallowed).
     public var copiedIDToastToken: Int?
+    /// The Settings TAB's state: seeded fresh when the tab is selected and dropped when it is
+    /// left (`closeSettingsTab()`), so it carries the old sheet's open/close semantics — a
+    /// re-seed on every visit, child effects cancelled on leave. `@Presents` so a child
+    /// `dismiss()` (Sign out, Reconnect, "Ask agent") still closes it.
     @Presents public var settings: SettingsFeature.State?
     @Presents public var archived: ArchivedSessionsFeature.State?
     /// Monotonic count of `archived` sheet presentations, bumped each time the sheet is
@@ -142,6 +158,19 @@ public struct SessionListFeature {
     /// an outcome landing after dismissal.
     public var archivedSheetGeneration: Int = 0
     @Presents public var addProfile: AddProfileFeature.State?
+    /// Pin writes are single-flight per row, independently of archive/delete.
+    public func canChangePin(id: Session.ID) -> Bool {
+      sessions[id: id] != nil && pinMutations[id] == nil
+    }
+
+    /// Both list and search requests use the selected literal profile.
+    fileprivate var canWritePinsToServer: Bool { profilesSupported }
+
+    /// Stable across token refreshes and equivalent trailing-slash server URLs.
+    public var pinMigrationServerID: String {
+      connection.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     @Presents public var confirmationDialog: ConfirmationDialogState<Action.Dialog>?
 
     /// The default profile name — never renamable/deletable, and the implicit fallback.
@@ -173,6 +202,7 @@ public struct SessionListFeature {
       calendar: Calendar = .autoupdatingCurrent,
       seenCounts: [String: Int] = [:],
       pinnedIDs: [String] = [],
+      pinMutations: [String: PinMutation] = [:],
       archivingIDs: Set<String> = [],
       deletingIDs: Set<String> = [],
       deleteSupported: Bool = true,
@@ -188,10 +218,13 @@ public struct SessionListFeature {
       renamingProfileName: String? = nil,
       profileRenameDraft: String = "",
       pushAvailable: Bool = true,
-      showPushSetupSheet: Bool = false,
+      pushCard: SessionListFeature.PushCard? = nil,
+      showsOnboardingTips: Bool = true,
       cronJobs: IdentifiedArrayOf<CronJob> = [],
       cronJobsSupported: Bool = true,
       expandedCronJobID: String? = nil,
+      expandedCronRuns: [Session]? = nil,
+      expandedCronRunsFailed: Bool = false,
       cronActionInFlightIDs: Set<String> = [],
       copiedIDToastToken: Int? = nil,
       settings: SettingsFeature.State? = nil,
@@ -207,6 +240,7 @@ public struct SessionListFeature {
       self.calendar = calendar
       self.seenCounts = seenCounts
       self.pinnedIDs = pinnedIDs
+      self.pinMutations = pinMutations
       self.archivingIDs = archivingIDs
       self.deletingIDs = deletingIDs
       self.deleteSupported = deleteSupported
@@ -222,10 +256,13 @@ public struct SessionListFeature {
       self.renamingProfileName = renamingProfileName
       self.profileRenameDraft = profileRenameDraft
       self.pushAvailable = pushAvailable
-      self.showPushSetupSheet = showPushSetupSheet
+      self.pushCard = pushCard
+      self.showsOnboardingTips = showsOnboardingTips
       self.cronJobs = cronJobs
       self.cronJobsSupported = cronJobsSupported
       self.expandedCronJobID = expandedCronJobID
+      self.expandedCronRuns = expandedCronRuns
+      self.expandedCronRunsFailed = expandedCronRunsFailed
       self.cronActionInFlightIDs = cronActionInFlightIDs
       self.copiedIDToastToken = copiedIDToastToken
       self.settings = settings
@@ -243,6 +280,14 @@ public struct SessionListFeature {
       profilesSupported ? selectedProfileName : nil
     }
 
+    /// Whether the header offers the profile Edit menu (Rename / Delete): only for a KNOWN
+    /// custom profile — never the default one, and not before the profiles list has loaded
+    /// the selection (the rename/delete actions would no-op on an unknown name).
+    public var canEditSelectedProfile: Bool {
+      guard profilesSupported, let profile = profiles[id: selectedProfileName] else { return false }
+      return !profile.isDefault
+    }
+
     /// The destructive action the trailing swipe actually offers: the persisted
     /// preference, clamped back to `.archive` while the agent lacks the DELETE
     /// capability (a stale `.delete` pref must never surface a dead button).
@@ -252,17 +297,39 @@ public struct SessionListFeature {
 
     /// Dismiss everything the list can present (sheets, the action sheet, the rename alerts) —
     /// for routing that can arrive while one is up (an App Intent, #93), so the chat it opens
-    /// isn't left behind a sheet.
+    /// isn't left behind a sheet. NOT the Settings tab: it is no presentation, and nil-ing it
+    /// here (from `AppFeature`, outside the list's `ifLet`) would leave its effects running. In
+    /// compact the chat's marker leaves the tab through `AppFeature`'s path rule; in regular
+    /// the chat seats in the detail column beside it.
     mutating func dismissPresentations() {
-      settings = nil
       archived = nil
       addProfile = nil
       confirmationDialog = nil
-      showPushSetupSheet = false
       renamingID = nil
       renameDraft = ""
       renamingProfileName = nil
       profileRenameDraft = ""
+    }
+
+    /// Copy the list facts Settings was seeded with into the open tab (no-op when closed).
+    /// Only the list-owned facts: the Live Activity prefs and the swipe default are Settings'
+    /// own (it writes them and tells the list).
+    mutating func syncSettingsSeed() {
+      guard var seeded = settings else { return }
+      seeded.connection = connection
+      seeded.pushAvailable = pushAvailable
+      seeded.deleteSupported = deleteSupported
+      seeded.profileName = scopedProfileName
+      if seeded != settings { settings = seeded }
+    }
+
+    /// Leave the Settings tab: drop its state and fall back to Sessions. Every path that
+    /// clears `settings` goes through here, so `selectedTab == .settings` never outlives it.
+    mutating func closeSettingsTab() {
+      settings = nil
+      if selectedTab == .settings {
+        selectedTab = .sessions
+      }
     }
 
     /// True while a search query is active — the list shows flat results, not date
@@ -271,9 +338,10 @@ public struct SessionListFeature {
       !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    /// Cron-scheduled sessions, pulled out of the interactive list and shown in their own
-    /// always-on "Cron Jobs" section. Sorted by recency (`updatedAt` desc, `nil` last),
-    /// mirroring `chronologicalSessions`.
+    /// Cron-scheduled sessions, pulled out of the interactive list: the flat Cron Jobs
+    /// fallback for agents without the jobs API (with it they are not rendered and don't
+    /// gate the tab). Sorted by recency (`updatedAt` desc, `nil` last), mirroring
+    /// `chronologicalSessions`.
     public var cronSessions: [Session] {
       sessions.filter(\.isCron)
         .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
@@ -290,62 +358,45 @@ public struct SessionListFeature {
     /// section into a full history browser (mirrors the desktop sidebar's limit).
     public static let cronPeekLimit = 5
 
-    /// The Cron Jobs tab grouped desktop-style: one entry per *job* (sorted soonest
-    /// next-run first, no-next-run last, then title), each carrying its most recent *runs*
-    /// (the cron sessions whose id-embedded job id matches, capped to `cronPeekLimit`).
-    /// Empty when the agent lacks the jobs API or no jobs were fetched yet — the view then
-    /// falls back to the flat run list.
-    public var cronJobGroups: [CronJobGroup] {
-      guard cronJobsSupported, !cronJobs.isEmpty else { return [] }
-      var runsByJob: [String: [Session]] = [:]
-      for session in cronSessions {  // recency-sorted, so each bucket inherits newest-first
-        guard let jobID = CronJob.jobID(fromSessionID: session.id) else { continue }
-        runsByJob[jobID, default: []].append(session)
-      }
-      let unread = unreadSessionIDs
-      return cronJobs.elements
-        .sorted(by: Self.cronJobOrder)
-        .map { job in
-          let runs = runsByJob[job.id] ?? []
-          return CronJobGroup(
-            job: job,
-            runs: Array(runs.prefix(Self.cronPeekLimit)),
-            // Unread is judged over ALL the job's runs (not just the peeked ones) so a
-            // burst of runs can't hide an unread older one.
-            hasUnread: runs.contains { unread.contains($0.id) }
-          )
-        }
+    /// The Cron Jobs tab's job rows, desktop-style: the fetched jobs only, sorted soonest
+    /// next-run first, no-next-run last, then title. A job's runs are NOT derived from the
+    /// session list (upstream `local-*` run ids carry no job id); the expanded job loads them
+    /// from `/runs` into `expandedCronRuns`. Empty when the agent lacks the jobs API — the view
+    /// then falls back to the flat `cronSessions` list.
+    public var sortedCronJobs: [CronJob] {
+      guard cronJobsSupported else { return [] }
+      return cronJobs.elements.sorted(by: Self.cronJobOrder)
     }
 
-    /// Cron sessions that match none of the fetched jobs (deleted job, legacy id shape) —
-    /// rendered flat below the groups so no run is ever invisible. Empty while job grouping is
-    /// inactive (the flat fallback shows everything then).
-    public var unmatchedCronSessions: [Session] {
-      guard cronJobsSupported, !cronJobs.isEmpty else { return [] }
-      let known = Set(cronJobs.ids)
-      return cronSessions.filter { session in
-        CronJob.jobID(fromSessionID: session.id).map { !known.contains($0) } ?? true
-      }
-    }
-
-    /// Whether there is cron content for the Cron Jobs tab: any cron run, or any fetched
-    /// job — a job with no runs (in the fetched window) stays reachable for Run now / Pause /
-    /// Resume.
+    /// Whether there is cron content for the Cron Jobs tab. With the jobs API only the jobs
+    /// count — a job with no runs stays reachable for Run now / Pause / Resume / Delete, and
+    /// runs (incl. a deleted job's) never bring the tab back on their own. Without it, the
+    /// flat fallback's cron runs.
     public var hasCronContent: Bool {
-      !cronSessions.isEmpty || !cronJobGroups.isEmpty
+      cronJobsSupported ? !cronJobs.isEmpty : !cronSessions.isEmpty
     }
 
-    /// Whether the bottom bar shows the Sessions | Cron Jobs tabs: only with cron content,
-    /// and not while the search field is open or a query is active (search is a
-    /// Sessions-only mode).
+    /// Whether the bottom bar shows the tab pill: always (Settings is always a tab), except
+    /// while the search field is open or a query is active (search is a Sessions-only mode).
     public var showsTabBar: Bool {
-      hasCronContent && !isSearchPresented && !isSearching
+      !isSearchPresented && !isSearching
     }
 
-    /// The tab the list actually renders: `selectedTab` while the tab bar shows, else
-    /// Sessions — so a profile or poll that drops every cron row never strands an empty tab.
+    /// The tabs the pill offers: Sessions, Cron Jobs only with cron content, then Settings.
+    public var availableTabs: [SessionListTab] {
+      hasCronContent ? [.sessions, .cron, .settings] : [.sessions, .settings]
+    }
+
+    /// The tab the home screen actually renders: `selectedTab` while the tab bar shows and
+    /// that tab exists, else Sessions — so a profile or poll that drops every cron row never
+    /// strands an empty tab, and a Settings selection without seeded state never renders.
     public var effectiveTab: SessionListTab {
-      showsTabBar ? selectedTab : .sessions
+      guard showsTabBar else { return .sessions }
+      switch selectedTab {
+      case .sessions: return .sessions
+      case .cron: return hasCronContent ? .cron : .sessions
+      case .settings: return settings != nil ? .settings : .sessions
+      }
     }
 
     /// Whether the Sessions tab shows the "No sessions" placeholder: no search hit (or, outside
@@ -356,18 +407,36 @@ public struct SessionListFeature {
         && (isSearching ? sessions.isEmpty : interactiveSessions.isEmpty)
     }
 
-    /// An empty non-search list with no jobs known yet: the load's sequential cron fetch
-    /// decides whether a Cron Jobs tab appears, so `isLoading` holds until that response
-    /// lands and the list settles once (placeholder and tab bar together).
-    var awaitsCronJobs: Bool {
-      sessions.isEmpty && cronJobs.isEmpty && cronJobsSupported && !isSearching
+    /// Whether the push card renders: a verdict set it, on the Sessions tab, and never with a
+    /// search query active. While it shows, the "No sessions" placeholder flows as a row under
+    /// it instead of floating centred over the list (where a tall card would collide with it).
+    public var showsPushCard: Bool {
+      pushCard != nil && effectiveTab == .sessions && !isSearching
     }
 
-    /// Cron sessions with unseen output — the section header's aggregate badge (the
-    /// desktop's `CRON JOBS 4`), visible without scrolling into the section.
-    public var cronUnreadCount: Int {
-      let unread = unreadSessionIDs
-      return cronSessions.filter { unread.contains($0.id) }.count
+    /// Whether the tips row renders under the push card: not hidden by the user, on the
+    /// Sessions tab, and never with a search query active (like `showsPushCard`).
+    public var showsOnboardingTipsRow: Bool {
+      showsOnboardingTips && effectiveTab == .sessions && !isSearching
+    }
+
+    /// The tips the row offers, in order. The profiles tip needs the profiles API (the pill it
+    /// points at is hidden without it); voice and swipe actions are always available.
+    public var onboardingTips: [SessionListFeature.OnboardingTip] {
+      (profilesSupported ? [.profiles] : []) + [.voice, .swipeActions]
+    }
+
+    /// Whether the "No sessions" placeholder flows as a row under the leading cards (push card,
+    /// tips) instead of floating centred over the list, where it would collide with them.
+    public var showsInlineEmptyPlaceholder: Bool {
+      showsEmptyPlaceholder && (showsPushCard || showsOnboardingTipsRow)
+    }
+
+    /// A non-search list with no interactive session and no jobs known yet: the load's
+    /// sequential cron fetch decides whether a Cron Jobs tab appears, so `isLoading` holds
+    /// until that response lands and the list settles once (placeholder and tab bar together).
+    var awaitsCronJobs: Bool {
+      interactiveSessions.isEmpty && cronJobs.isEmpty && cronJobsSupported && !isSearching
     }
 
     /// Desktop-parity job ordering: soonest next run first, jobs without a next run sink
@@ -449,11 +518,13 @@ public struct SessionListFeature {
     case newSessionButtonTapped
     case pinSession(id: Session.ID)
     case unpinSession(id: Session.ID)
+    case pinMigrationFinished(server: String, id: Session.ID, profileName: String, error: RESTError?)
+    case pinWriteFinished(id: Session.ID, profileName: String, error: RESTError?)
     /// Put a row's session id on the pasteboard and raise the transient confirmation toast.
     case copyIDButtonTapped(id: Session.ID)
     /// The copy toast's dwell time elapsed — hide it.
     case copiedIDToastExpired
-    /// A bottom-bar tab was tapped.
+    /// A bottom-bar tab was tapped. Selecting Settings seeds its state; leaving it drops it.
     case selectTab(SessionListTab)
     /// The toolbar's search button: open the search field.
     case searchButtonTapped
@@ -515,7 +586,6 @@ public struct SessionListFeature {
     /// Dismiss the rename alert without applying changes.
     case cancelRename
     case confirmationDialog(PresentationAction<Dialog>)
-    case settingsButtonTapped
     case settings(PresentationAction<SettingsFeature.Action>)
     /// Open the Archived sessions sheet (from the top-trailing menu).
     case archivedButtonTapped
@@ -569,33 +639,51 @@ public struct SessionListFeature {
     /// the previous jobs so the section doesn't flap.
     case cronJobsResponse(Result<[CronJob], RESTError>)
     /// Toggle a job's inline run-peek (single-open: expanding one collapses another).
+    /// Expanding fetches the job's runs from `/runs`; collapsing cancels that fetch.
     case cronJobTapped(id: String)
+    /// Result of the expanded job's `/runs` fetch. Dropped when `jobID` is no longer the
+    /// expanded job (a late response after a collapse or switch).
+    case cronRunsResponse(jobID: String, Result<[Session], RESTError>)
+    /// A run row under the expanded job was tapped: a session run (`isCron`) opens its chat;
+    /// a script-only `cron_output` row has no session and does nothing.
+    case cronRunTapped(id: Session.ID)
     /// "Run now" on a job row — `POST /api/cron/jobs/{id}/trigger`.
     case triggerCronJob(id: String)
     /// Pause a job — `POST /api/cron/jobs/{id}/pause`.
     case pauseCronJob(id: String)
     /// Resume a paused job — `POST /api/cron/jobs/{id}/resume`.
     case resumeCronJob(id: String)
+    /// "Delete" on a job row: raise the confirmation dialog (`Dialog.confirmDeleteCronJob`).
+    /// Confirming sends `DELETE /api/cron/jobs/{id}`.
+    case deleteCronJobTapped(id: String)
     /// A cron action RPC finished: lift the in-flight guard; on success refetch from the
-    /// server (the full load after a trigger so the new run session appears, jobs-only for
-    /// pause/resume); on failure surface the banner. No optimistic mutation — job state is
-    /// server-computed and the refetch/poll reconciles.
-    case cronJobActionFinished(id: String, refetchSessions: Bool, error: RESTError?)
+    /// server (see `CronJobActionKind`); on failure surface the banner. No optimistic mutation — job
+    /// state is server-computed and the refetch/poll reconciles. A delete's success (or 404:
+    /// already gone) drops the job locally first so the row disappears at once.
+    case cronJobActionFinished(id: String, kind: CronJobActionKind, error: RESTError?)
     // MARK: Push notifications
     /// Kicks off contextual push setup once the list appears (right after login): first probe
     /// the `hermes-push` plugin readiness, then branch on the result. Fired from `.task`.
     case setupPush
-    /// Result of the plugin-readiness probe (`rest.pushPluginStatus`). `ready` → permission +
-    /// register (and clear any snooze); `notReady` → set `pushAvailable=false` and raise the
-    /// info sheet unless snoozed; `unknown` → leave capability as-is (don't nag).
+    /// Result of the plugin-readiness probe (`rest.pushPluginStatus`). `ready` → read the
+    /// notification permission (no prompt); `notReady` → set `pushAvailable=false` and show
+    /// the install card unless snoozed; `unknown` → leave capability as-is (don't nag).
     case pushPluginStatusLoaded(PushPluginStatus)
+    /// The current notification permission, read once the plugin is ready. `authorized` /
+    /// `provisional` → silent register (and clear any snooze); `notDetermined` → the Turn on
+    /// card unless snoozed; `denied` → nothing.
+    case pushAuthorizationStatusLoaded(PushAuthorizationStatus)
     /// Begin the permission-request + token-observe flow (only when the plugin is ready).
     case requestPushAuthorization
-    /// The info sheet's "Ask agent to install" button — open a new chat with the install prompt
-    /// pre-filled in the composer (dismisses the sheet; bubbles up via the create delegate).
-    case pushSetupAskAgentTapped
-    /// The info sheet's "Later" button — dismiss + snooze (Fibonacci backoff on the Later count).
-    case pushSetupLaterTapped
+    /// The install card's "Ask my agent to install it" — open a new chat with the install
+    /// prompt pre-filled in the composer (bubbles up via the create delegate).
+    case pushCardAskAgentButtonTapped
+    /// The enable card's "Turn on" — the only path to the system permission prompt.
+    case pushCardEnableButtonTapped
+    /// Either card's "Not now" / "Later" — hide + snooze (Fibonacci backoff on the count).
+    case pushCardNotNowButtonTapped
+    /// The tips row's "Hide" — hide the row and persist the choice until the next logout.
+    case onboardingTipsHideButtonTapped
     /// A device token arrived from `PushClient.register()` (initial registration OR an OS
     /// rotation) — (re-)register it with the agent. Carries the lowercase-hex token.
     case pushTokenReceived(String)
@@ -610,6 +698,18 @@ public struct SessionListFeature {
       case confirmArchive(id: Session.ID)
       case confirmDelete(id: Session.ID)
       case confirmDeleteProfile(name: String)
+      case confirmDeleteCronJob(id: String)
+    }
+
+    /// Which cron job action finished — decides the post-success reconcile.
+    public enum CronJobActionKind: Equatable, Sendable {
+      /// Run now: full load (a new run session) plus the expanded job's runs.
+      case trigger
+      /// Pause/resume: jobs-only refetch.
+      case pauseResume
+      /// Delete: drop the job (404 = already gone = success), supersede a pending list load
+      /// (which refetches jobs), else a jobs-only refetch.
+      case delete
     }
 
     @CasePathable
@@ -643,10 +743,36 @@ public struct SessionListFeature {
     }
   }
 
+  /// The inline push card's variant (`State.pushCard`).
+  public enum PushCard: Equatable, Sendable {
+    /// The plugin is ready and permission was never asked: preview + "Turn on".
+    case enableNotifications
+    /// The plugin isn't installed / enabled: "Ask my agent to install it".
+    case installPlugin
+  }
+
+  /// One card in the dismissible tips row (`State.onboardingTips`). The copy lives in the view.
+  public enum OnboardingTip: Equatable, Sendable {
+    /// Switch profiles from the pill at the top (only with the profiles API).
+    case profiles
+    /// Swipe a session to archive/delete or rename it.
+    case swipeActions
+    /// Dictate with the mic in a chat.
+    case voice
+  }
+
   // One id for BOTH the list fetch and the search fetch: any new fetch (list refresh, poll,
   // or search) cancels the previous in-flight one, so a late list response can't overwrite
-  // active search results (and vice versa). `poll` is the separate timer loop.
-  private enum CancelID { case fetch, poll, pushTokens, copyIDToast }
+  // active search results (and vice versa). `poll` is the separate timer loop. `cronRuns` is
+  // the expanded job's `/runs` fetch — its own id so it never cancels (or is cancelled by)
+  // the list load it rides alongside. `pushTokens` covers the whole push chain (plugin probe,
+  // permission read, token stream) on purpose: a Turn on tap during the permission read
+  // cancels it, so a stale `.notDetermined` can't bring the card back. `profilesProbe` is
+  // the `.task` profiles probe, NEVER `fetch`: a list load (the 10 s poll, pull-to-refresh,
+  // a search keystroke, archive/rename/delete) landing before a slow `/api/profiles` would
+  // cancel it silently, and only the next `.task` re-probes — meanwhile the seeded
+  // `profilesSupported` showed a profile menu with no profiles in it.
+  private enum CancelID { case fetch, poll, profilesProbe, pushTokens, copyIDToast, cronRuns }
 
   /// How often the list auto-refreshes while visible, to keep `isActive` (working glow) fresh.
   private static let pollInterval: Duration = .seconds(10)
@@ -692,7 +818,7 @@ public struct SessionListFeature {
               await send(.profilesResponse(.failure(.unreachable)))
             }
           }
-          .cancellable(id: CancelID.fetch, cancelInFlight: true),
+          .cancellable(id: CancelID.profilesProbe, cancelInFlight: true),
           .run { [clock, interval = Self.pollInterval] send in
             while true {
               try await clock.sleep(for: interval)
@@ -700,9 +826,9 @@ public struct SessionListFeature {
             }
           }
           .cancellable(id: CancelID.poll, cancelInFlight: true),
-          // Contextual push setup: prompt for permission now that we're past login, and (if
-          // granted) start observing device tokens. Per the product decision the permission
-          // prompt fires here on the sessions list — never at first launch.
+          // Contextual push setup now that we're past login: decide which push card (if any)
+          // to show, or register silently when permission was already granted. The system
+          // permission prompt itself waits for the card's Turn on tap.
           .send(.setupPush)
         )
 
@@ -710,8 +836,10 @@ public struct SessionListFeature {
         // Stop the poll (and any in-flight fetch / search debounce) when the list goes away.
         return .merge(
           .cancel(id: CancelID.poll),
+          .cancel(id: CancelID.profilesProbe),
           .cancel(id: CancelID.fetch),
-          .cancel(id: CancelID.pushTokens)
+          .cancel(id: CancelID.pushTokens),
+          .cancel(id: CancelID.cronRuns)
         )
 
       case .pollTick:
@@ -759,6 +887,11 @@ public struct SessionListFeature {
         // Defensive uniquing (first wins): the unscoped fetch aggregates every profile's
         // jobs file, so never crash on a duplicated id (e.g. a copied profile home).
         state.cronJobs = IdentifiedArray(jobs, uniquingIDsWith: { first, _ in first })
+        // A job removed elsewhere (desktop, CLI, a one-shot finishing) takes its expansion
+        // with it, so nothing keeps polling its runs.
+        if let expanded = state.expandedCronJobID, state.cronJobs[id: expanded] == nil {
+          return collapseExpandedCronJob(&state)
+        }
         return .none
 
       case let .cronJobsResponse(.failure(error)):
@@ -768,48 +901,125 @@ public struct SessionListFeature {
         if error == .notFound {
           state.cronJobsSupported = false
           state.cronJobs = []
-          state.expandedCronJobID = nil
+          return collapseExpandedCronJob(&state)
         }
         return .none
 
       case let .cronJobTapped(id):
-        state.expandedCronJobID = state.expandedCronJobID == id ? nil : id
+        // Tapping the open job collapses it; any other job becomes the single open one.
+        // Either way the runs slot starts empty — never show one job's runs under another.
+        guard state.expandedCronJobID != id else { return collapseExpandedCronJob(&state) }
+        state.expandedCronJobID = id
+        state.expandedCronRuns = nil
+        state.expandedCronRunsFailed = false
+        // `cancelInFlight` drops the previous job's fetch on a switch.
+        return fetchExpandedCronRuns(state)
+
+      case let .cronRunsResponse(jobID, result):
+        // A late response for a job that is no longer expanded never lands.
+        guard jobID == state.expandedCronJobID else { return .none }
+        switch result {
+        case let .success(runs):
+          state.expandedCronRuns = runs
+          state.expandedCronRunsFailed = false
+        case .failure:
+          // Only a FIRST load failure shows "Couldn't load runs"; a failed refresh keeps
+          // the runs already on screen (the next poll retries).
+          if state.expandedCronRuns == nil { state.expandedCronRunsFailed = true }
+        }
         return .none
 
+      case let .cronRunTapped(id):
+        // Looked up in the runs slot, not `state.sessions`: an older run may be outside the
+        // list's 50-row cron slice. Script-only `cron_output` rows have no session to open.
+        guard let run = state.expandedCronRuns?.first(where: { $0.id == id }), run.isCron
+        else { return .none }
+        return .merge(
+          markLocallyRead(id, state: &state),
+          .send(.delegate(.openSession(run)))
+        )
+
       case let .triggerCronJob(id):
-        return performCronAction(&state, id: id, refetchSessions: true) { rest, conn, jobID, profile in
+        return performCronAction(&state, id: id, kind: .trigger) { rest, conn, jobID, profile in
           try await rest.triggerCronJob(conn, jobID, profile)
         }
 
       case let .pauseCronJob(id):
-        return performCronAction(&state, id: id, refetchSessions: false) { rest, conn, jobID, profile in
+        return performCronAction(&state, id: id, kind: .pauseResume) { rest, conn, jobID, profile in
           try await rest.pauseCronJob(conn, jobID, profile)
         }
 
       case let .resumeCronJob(id):
-        return performCronAction(&state, id: id, refetchSessions: false) { rest, conn, jobID, profile in
+        return performCronAction(&state, id: id, kind: .pauseResume) { rest, conn, jobID, profile in
           try await rest.resumeCronJob(conn, jobID, profile)
         }
 
-      case let .cronJobActionFinished(id, refetchSessions, error):
+      case let .deleteCronJobTapped(id):
+        // The title names the job, so a row whose job vanished (poll, profile switch) since
+        // the menu rendered has nothing to confirm.
+        guard state.cronJobsSupported, let job = state.cronJobs[id: id] else { return .none }
+        state.confirmationDialog = ConfirmationDialogState {
+          TextState("Delete “\(job.title)”?")
+        } actions: {
+          ButtonState(role: .destructive, action: .confirmDeleteCronJob(id: id)) {
+            TextState("Delete")
+          }
+          ButtonState(role: .cancel) {
+            TextState("Cancel")
+          }
+        } message: {
+          TextState(
+            "The job and its schedule are removed from the agent. Its past runs are kept on the server but won’t be listed here."
+          )
+        }
+        return .none
+
+      case let .confirmationDialog(.presented(.confirmDeleteCronJob(id))):
+        // Not optimistic: the row stays until the server confirms (`.cronJobActionFinished`).
+        guard state.cronJobsSupported else { return .none }
+        // A confirmed destructive action is never dropped silently by the in-flight guard.
+        guard !state.cronActionInFlightIDs.contains(id) else {
+          state.loadError = Self.cronJobBusyMessage
+          return .none
+        }
+        return performCronAction(&state, id: id, kind: .delete) { rest, conn, jobID, profile in
+          try await rest.deleteCronJob(conn, jobID, profile)
+        }
+
+      case let .cronJobActionFinished(id, kind, error):
         state.cronActionInFlightIDs.remove(id)
-        if let error {
+        // A delete's 404 means the job is already gone — the outcome the user asked for.
+        if let error, !(kind == .delete && error == .notFound) {
           // Surface the server's copy verbatim (e.g. a 400 detail) via the existing banner.
           state.loadError = error.message
           return .none
         }
         // Success → reconcile from the server. A trigger just spawned a run session, so do
-        // the full load (sessions + jobs); pause/resume only changed the job, so a
-        // jobs-only refetch avoids churning the list.
-        if refetchSessions { return load(&state) }
-        return .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
-          await send(fetchCronJobs(rest: rest, connection: connection, profile: profile))
+        // the full load (sessions + jobs + the expanded job's runs); pause/resume only
+        // changed the job, so a jobs-only refetch avoids churning the list.
+        switch kind {
+        case .trigger:
+          return load(&state)
+        case .pauseResume:
+          return refetchCronJobs(state)
+        case .delete:
+          // Drop the row now rather than waiting on the refetch; collapsing a deleted
+          // expanded job also cancels its runs fetch.
+          state.cronJobs.remove(id: id)
+          let collapse = state.expandedCronJobID == id ? collapseExpandedCronJob(&state) : .none
+          // A list load already in flight may carry a pre-DELETE jobs response that would
+          // bring the row back: supersede it. Decided BEFORE `cancelOrRestartFetch`, which
+          // restarts exactly when this holds; the restarted load refetches the jobs itself
+          // (a search load skips them, and the search's clear reloads them).
+          let restartsLoad = state.isLoading || state.isSearching
+          let fetch = cancelOrRestartFetch(&state)
+          return .merge(collapse, fetch, restartsLoad ? .none : refetchCronJobs(state))
         }
 
       case .setupPush:
         // Push onboarding (after login, on the list). FIRST probe whether the `hermes-push`
         // plugin is installed + enabled (a REST-only check that works without the WS); the
-        // result decides whether to request permission, raise the info sheet, or do nothing.
+        // result decides which card to show, whether to register silently, or nothing.
         return .run { [rest, connection = state.connection] send in
           let status = (try? await rest.pushPluginStatus(connection)) ?? .unknown
           await send(.pushPluginStatusLoaded(status))
@@ -819,22 +1029,42 @@ public struct SessionListFeature {
       case let .pushPluginStatusLoaded(status):
         switch status {
         case .ready:
-          // Plugin is live → push is available. Clear any prior snooze (so a later uninstall
-          // re-prompts fresh) and run the existing permission-request + token-register flow.
+          // Plugin is live → push is available. Read the permission WITHOUT prompting: it
+          // decides between a silent register and the Turn on card. An install card from an
+          // earlier probe is stale now; a Turn on card stays until that read decides.
           state.pushAvailable = true
-          state.showPushSetupSheet = false
-          preferences.clearPushPromptSnooze()
-          return .send(.requestPushAuthorization)
+          if state.pushCard == .installPlugin { state.pushCard = nil }
+          return .run { [push] send in
+            await send(.pushAuthorizationStatusLoaded(push.authorizationStatus()))
+          }
+          .cancellable(id: CancelID.pushTokens, cancelInFlight: true)
         case .notReady:
-          // Plugin absent / disabled → push isn't available. Raise the info sheet unless the
+          // Plugin absent / disabled → push isn't available. Show the install card unless the
           // prompt is currently snoozed (Fibonacci backoff from prior "Later" taps).
           state.pushAvailable = false
-          if !isPushPromptSnoozed() {
-            state.showPushSetupSheet = true
-          }
+          state.pushCard = isPushPromptSnoozed() ? nil : .installPlugin
           return .none
         case .unknown:
           // Endpoint 404 / network error — can't tell. Don't nag; leave capability as-is.
+          return .none
+        }
+
+      case let .pushAuthorizationStatusLoaded(status):
+        switch status {
+        case .authorized, .provisional:
+          // Already granted → register silently (no prompt: `requestAuthorization` resolves
+          // at once). Clear any prior snooze so a later uninstall re-prompts fresh.
+          state.pushCard = nil
+          preferences.clearPushPromptSnooze()
+          return .send(.requestPushAuthorization)
+        case .notDetermined:
+          // Never asked → offer the Turn on card unless the user snoozed it.
+          state.pushCard = isPushPromptSnoozed() ? nil : .enableNotifications
+          return .none
+        case .denied:
+          // The user said no in the system prompt (or Settings) — don't nag; Settings has the
+          // toggle.
+          state.pushCard = nil
           return .none
         }
 
@@ -851,19 +1081,30 @@ public struct SessionListFeature {
         }
         .cancellable(id: CancelID.pushTokens, cancelInFlight: true)
 
-      case .pushSetupAskAgentTapped:
-        // Dismiss the sheet and open a new chat with the install prompt pre-filled (NOT sent —
+      case .pushCardAskAgentButtonTapped:
+        // Hide the card and open a new chat with the install prompt pre-filled (NOT sent —
         // the user reviews and sends). Bubbles up via the create delegate, carrying the text.
-        state.showPushSetupSheet = false
+        state.pushCard = nil
         return .send(.delegate(.createSession(initialComposerText: PushSetup.installPrompt)))
 
-      case .pushSetupLaterTapped:
-        // Dismiss + snooze: bump the Later count and push the next prompt out by the matching
-        // Fibonacci interval, persisting both so it survives relaunch.
-        state.showPushSetupSheet = false
+      case .pushCardEnableButtonTapped:
+        // The user opted in → the system prompt, then (if granted) the token register.
+        state.pushCard = nil
+        return .send(.requestPushAuthorization)
+
+      case .pushCardNotNowButtonTapped:
+        // Hide + snooze: bump the count and push the next prompt out by the matching
+        // Fibonacci interval, persisting both so it survives relaunch. Both card variants
+        // share the one snooze.
+        state.pushCard = nil
         let count = (preferences.loadPushPromptSnooze()?.count ?? 0) + 1
         let until = now.addingTimeInterval(Double(pushPromptSnoozeDays(laterCount: count)) * 86_400)
         preferences.savePushPromptSnooze(count, until)
+        return .none
+
+      case .onboardingTipsHideButtonTapped:
+        state.showsOnboardingTips = false
+        preferences.saveOnboardingTipsDismissed(true)
         return .none
 
       case let .pushTokenReceived(token):
@@ -909,6 +1150,9 @@ public struct SessionListFeature {
         // mid-window would otherwise bare-cancel the pending reload and strand the stale
         // search results until the next poll.
         guard state.isSearching else { return load(&state) }
+        // Clear the previous request's error now, not on response: a mutation may fail
+        // while this search is in flight, and its banner must survive the response.
+        state.loadError = nil
         return .run { [
           rest, profiles, connection = state.connection, query = state.searchQuery, clock,
           profile = state.scopedProfileName
@@ -926,40 +1170,9 @@ public struct SessionListFeature {
         // Other bindings (e.g. renameDraft) are pure state edits — no side effects.
         return .none
 
-      case let .sessionsResponse(.success(sessions)):
-        state.loadError = nil
-        // Belt-and-suspenders: drop any session whose archive PATCH or DELETE is still in
-        // flight, so a fetch that completes during that window can't repopulate the removed row.
-        let inFlight = state.archivingIDs.union(state.deletingIDs)
-        let filtered = inFlight.isEmpty
-          ? sessions
-          : sessions.filter { !inFlight.contains($0.id) }
-        // The list AND search endpoints can return the same session id more than once
-        // (#78). `IdentifiedArray(uniqueElements:)` preconditions on unique ids and
-        // trapped in the field, so dedupe first — keep the FIRST occurrence (server order).
-        state.sessions = IdentifiedArray(filtered, uniquingIDsWith: { first, _ in first })
-        // Only an unfiltered response feeds the widgets' source. The list and search fetches
-        // share `CancelID.fetch` (cancel-in-flight), so the response landing now is the one
-        // the current query started: searching ⇔ a search response.
-        if !state.isSearching {
-          state.statusSessions = state.sessions
-        }
-        state.isLoading = state.awaitsCronJobs
-        let visible = state.sessions
-        // Seed last-seen counts for newly-discovered sessions so they don't all show as
-        // unread on first sight; only later increases flag unread.
-        var seeded = false
-        for session in visible where state.seenCounts[session.id] == nil {
-          state.seenCounts[session.id] = session.messageCount ?? 0
-          seeded = true
-        }
-        guard seeded else { return .none }
-        return persistSeenCounts(state.seenCounts)
-
-      case let .sessionsResponse(.failure(error)):
-        state.isLoading = false
-        state.loadError = error.message
-        return .none
+      case let .sessionsResponse(result):
+        let reconcilePins = state.profilesSupported && !state.isSearching
+        return applySessionsResponse(result, state: &state, reconcilePins: reconcilePins)
 
       case let .sessionTapped(id):
         guard let session = state.sessions[id: id] else { return .none }
@@ -969,13 +1182,38 @@ public struct SessionListFeature {
         )
 
       case let .pinSession(id):
-        guard !state.pinnedIDs.contains(id) else { return .none }
-        state.pinnedIDs.append(id)
-        return persistPinnedIDs(state.pinnedIDs)
+        return setPinned(&state, id: id, pinned: true)
 
       case let .unpinSession(id):
-        state.pinnedIDs.removeAll { $0 == id }
-        return persistPinnedIDs(state.pinnedIDs)
+        return setPinned(&state, id: id, pinned: false)
+
+      case let .pinMigrationFinished(server, id, profileName, error):
+        guard server == state.pinMigrationServerID,
+          let mutation = state.pinMutations[id], mutation.profileName == profileName,
+          preferences.loadPinMigration(server)?.pendingIDs.contains(id) == true
+        else { return .none }
+        state.pinMutations[id] = nil
+        // Failed automatic writes remain pending and silent until the next capable list.
+        guard error == nil else { return .none }
+        retireMigrationPin(server: server, id: id)
+        return cancelOrRestartFetch(&state)
+
+      case let .pinWriteFinished(id, profileName, error):
+        guard let mutation = state.pinMutations[id], mutation.profileName == profileName
+        else { return .none }
+        state.pinMutations[id] = nil
+        if let error {
+          state.pinnedIDs.removeAll { $0 == id }
+          if let index = mutation.previousIndex {
+            state.pinnedIDs.insert(id, at: min(index, state.pinnedIDs.count))
+          }
+          preferences.savePinnedIDs(state.pinnedIDs)
+          let fetch = cancelOrRestartFetch(&state)
+          state.loadError = error.message
+          return fetch
+        }
+        retireMigrationPin(server: state.pinMigrationServerID, id: id)
+        return cancelOrRestartFetch(&state)
 
       case let .copyIDButtonTapped(id):
         state.copiedIDToastToken = (state.copiedIDToastToken ?? 0) + 1
@@ -995,8 +1233,18 @@ public struct SessionListFeature {
         return .none
 
       case let .selectTab(tab):
+        if tab == .settings {
+          state.selectedTab = .settings
+          // Re-tapping the open tab keeps its state (and any sub-screen) as is.
+          if state.settings == nil {
+            seedSettings(&state)
+          }
+          return .none
+        }
+        state.closeSettingsTab()
         state.selectedTab = tab
-        return .none
+        // Runs aren't polled while the Cron Jobs tab is hidden (see `load`): catch up on return.
+        return state.effectiveTab == .cron ? fetchExpandedCronRuns(state) : .none
 
       case .searchButtonTapped:
         state.isSearchPresented = true
@@ -1031,12 +1279,12 @@ public struct SessionListFeature {
         // Capture rollback info BEFORE mutating: the session + its list index, the pin position
         // (if pinned) and prior seen baseline — so a failed RPC can restore everything locally.
         let session = state.sessions[index]
-        let pinIndex = state.pinnedIDs.firstIndex(of: id)
+        let pinIndex = state.pinMutations[id] == nil ? state.pinnedIDs.firstIndex(of: id) : nil
         let seenCount = state.seenCounts[id]
         // Optimistic removal: drop from the list + clear its pin/seen entries, persist,
         // then run the RPC. On failure we re-insert and surface the error.
         state.sessions.remove(id: id)
-        state.pinnedIDs.removeAll { $0 == id }
+        if state.pinMutations[id] == nil { state.pinnedIDs.removeAll { $0 == id } }
         state.seenCounts[id] = nil
         // Mark as in-flight so a fetch landing during the PATCH window filters it out and the
         // poll skips — closing the window where a reload could resurrect the removed row.
@@ -1092,15 +1340,16 @@ public struct SessionListFeature {
       case let .confirmationDialog(.presented(.confirmDelete(id))):
         // Same capability guard as `deleteButtonTapped` — the flag can flip (e.g. mirrored
         // from the archived sheet) while this dialog is already up.
-        guard state.deleteSupported, let index = state.sessions.index(id: id) else { return .none }
+        guard state.deleteSupported else { return .none }
+        guard let index = state.sessions.index(id: id) else { return .none }
         // Mirror of `.confirmArchive`: capture rollback info BEFORE mutating (session + list
         // index + pin position + seen baseline), then optimistically remove + persist and run
         // the DELETE. On failure everything is restored locally.
         let session = state.sessions[index]
-        let pinIndex = state.pinnedIDs.firstIndex(of: id)
+        let pinIndex = state.pinMutations[id] == nil ? state.pinnedIDs.firstIndex(of: id) : nil
         let seenCount = state.seenCounts[id]
         state.sessions.remove(id: id)
-        state.pinnedIDs.removeAll { $0 == id }
+        if state.pinMutations[id] == nil { state.pinnedIDs.removeAll { $0 == id } }
         state.seenCounts[id] = nil
         // In-flight guard: a fetch landing during the DELETE window filters this id out and
         // the poll skips — closing the window where a reload could resurrect the removed row.
@@ -1136,6 +1385,7 @@ public struct SessionListFeature {
         )
 
       case let .deleteSucceeded(id):
+        finishRemovalPins(&state, id: id)
         // DELETE landed (an `already_absent` body is success by contract) — clear the
         // transient guard so the poll resumes, and cancel/restart any fetch that started
         // during the window (see `cancelOrRestartFetch`): with the guard now gone, its
@@ -1180,6 +1430,7 @@ public struct SessionListFeature {
         return .none
 
       case let .archiveSucceeded(id):
+        finishRemovalPins(&state, id: id)
         // PATCH landed — clear the transient guard so the poll resumes. Cancel/restart any
         // fetch that started during the PATCH window (see `cancelOrRestartFetch`): with
         // the guard now gone, its (stale) response could otherwise resurrect the archived
@@ -1260,19 +1511,6 @@ public struct SessionListFeature {
       case .newSessionButtonTapped:
         return .send(.delegate(.createSession(initialComposerText: nil)))
 
-      case .settingsButtonTapped:
-        // `connection` carries the auth session (the Auth row / token-field gate read it).
-        state.settings = SettingsFeature.State(
-          connection: state.connection,
-          pushAvailable: state.pushAvailable,
-          defaultSwipeAction: state.defaultSwipeAction,
-          deleteSupported: state.deleteSupported,
-          liveActivityEnabled: preferences.loadLiveActivityEnabled(),
-          liveActivityShowsTitles: preferences.loadLiveActivityShowsTitles(),
-          profileName: state.scopedProfileName
-        )
-        return .none
-
       case .archivedButtonTapped:
         // New presentation → new generation: outcomes of DELETEs initiated under an
         // earlier presentation must not be re-injected into this one (see
@@ -1323,6 +1561,7 @@ public struct SessionListFeature {
         )
 
       case let .archivedDeleteSucceeded(id, generation):
+        finishRemovalPins(&state, id: id)
         // Server confirmed the sheet-initiated delete → the badge delegate fires (see
         // `Delegate.sessionDeleteSucceeded`), and the outcome is re-injected into the
         // sheet ONLY while the SAME presentation (`generation`) still owns this delete
@@ -1380,9 +1619,8 @@ public struct SessionListFeature {
         return load(&state)
 
       case let .profilesResponse(.failure(error)):
-        // A 404 (old agent) or any failure → behave as today: no scoping, unscoped fetch.
-        // Only the 404 verdict withdraws the persisted capability (a transient failure
-        // keeps it for the next launch).
+        // A 404 (old agent) withdraws the persisted capability. Transient failures keep it
+        // for the next launch while this session falls back to unscoped requests.
         if error == .notFound { preferences.clearSelectedProfileID() }
         state.profilesSupported = false
         state.profiles = []
@@ -1397,14 +1635,15 @@ public struct SessionListFeature {
         // No-op when already selected (avoids a redundant refetch / UI reset).
         guard name != state.selectedProfileName else { return .none }
         state.selectedProfileName = name
+        state.sessions = []
         // Reset the list UI on switch (search doesn't carry across profiles).
         state.searchQuery = ""
         // Cron jobs are profile-scoped too: drop the old profile's jobs + peek so the
         // section can't show cross-profile rows while the scoped refetch is in flight.
         state.cronJobs = []
-        state.expandedCronJobID = nil
+        let collapse = collapseExpandedCronJob(&state)
         preferences.saveSelectedProfileID(name)
-        return load(&state)
+        return .merge(collapse, load(&state))
 
       case .addProfileTapped:
         state.addProfile = AddProfileFeature.State(connection: state.connection)
@@ -1505,9 +1744,9 @@ public struct SessionListFeature {
           state.selectedProfileName = Self.State.defaultProfileName
           state.searchQuery = ""
           state.cronJobs = []
-          state.expandedCronJobID = nil
+          let collapse = collapseExpandedCronJob(&state)
           preferences.saveSelectedProfileID(Self.State.defaultProfileName)
-          return load(&state)
+          return .merge(collapse, load(&state))
         }
         return .none
 
@@ -1520,7 +1759,7 @@ public struct SessionListFeature {
         return .none
 
       case .settings(.presented(.delegate(.disconnect))):
-        state.settings = nil
+        state.closeSettingsTab()
         return .send(.delegate(.disconnect))
 
       case .settings(.presented(.delegate(.reconnect))):
@@ -1529,7 +1768,7 @@ public struct SessionListFeature {
 
       case let .settings(.presented(.delegate(.defaultSwipeActionChanged(action)))):
         // Mirror the new default immediately (Settings already persisted it) so the swipe
-        // rows are right the moment the sheet dismisses.
+        // rows are right the moment the tab is left.
         state.defaultSwipeAction = action
         return .none
 
@@ -1542,8 +1781,14 @@ public struct SessionListFeature {
       case .settings(.presented(.delegate(.installPushPlugin))):
         // The Settings push guide's "Ask agent" → dismiss Settings (Settings already requested
         // its own dismissal) and open a new chat with the install prompt pre-filled.
-        state.settings = nil
+        state.closeSettingsTab()
         return .send(.delegate(.createSession(initialComposerText: PushSetup.installPrompt)))
+
+      case .settings(.dismiss):
+        // A child `dismiss()` (Reconnect, Sign out, "Ask agent") closes the tab: the
+        // presentation reducer nils `settings` after this runs, so fall back to Sessions here.
+        state.closeSettingsTab()
+        return .none
 
       case .settings:
         return .none
@@ -1578,10 +1823,141 @@ public struct SessionListFeature {
         return .none
       }
     }
+    // An open Settings tab can stay up for a long time (the old sheet was short-lived) while
+    // the list underneath keeps polling: mirror the facts `seedSettings` copied, so a capability
+    // flip, a profile re-homed by a delete, or a re-auth's new connection reaches it in the
+    // same action that changed it. A no-op while the tab is closed.
+    Reduce { state, _ in
+      state.syncSettingsSeed()
+      return .none
+    }
+  }
+
+  private func retireMigrationPin(server: String, id: Session.ID) {
+    guard var migration = preferences.loadPinMigration(server) else { return }
+    migration.pendingIDs.removeAll { $0 == id }
+    preferences.savePinMigration(server, migration)
+  }
+
+  private func finishRemovalPins(_ state: inout State, id: Session.ID) {
+    // Confirmed removal supersedes a pending pin's rollback, without canceling its RPC.
+    state.pinMutations[id]?.previousIndex = nil
+    state.pinnedIDs.removeAll { $0 == id }
+    preferences.savePinnedIDs(state.pinnedIDs)
+  }
+
+  private func setPinned(_ state: inout State, id: Session.ID, pinned: Bool) -> Effect<Action> {
+    guard state.canChangePin(id: id), state.pinnedIDs.contains(id) != pinned else { return .none }
+    let previousIndex = state.pinnedIDs.firstIndex(of: id)
+    if pinned { state.pinnedIDs.append(id) }
+    else { state.pinnedIDs.removeAll { $0 == id } }
+    preferences.savePinnedIDs(state.pinnedIDs)
+    // A server-keyed checkpoint is also evidence of pin capability. Search omits
+    // pinned, so it must use that evidence rather than the individual search row.
+    guard state.canWritePinsToServer,
+      preferences.loadPinMigration(state.pinMigrationServerID) != nil
+        || (!state.isSearching && state.sessions[id: id]?.pinned != nil)
+    else { return .none }
+
+    let mutation = PinMutation(pinned: pinned, previousIndex: previousIndex,
+      profileName: state.selectedProfileName)
+    state.pinMutations[id] = mutation
+    return .run { [rest, connection = state.connection] send in
+      let error: RESTError?
+      do {
+        try await rest.setPinned(connection, id, pinned, mutation.profileName)
+        error = nil
+      } catch let failure { error = asRESTError(failure) }
+      await send(.pinWriteFinished(id: id, profileName: mutation.profileName, error: error))
+    }
+  }
+
+  private func applySessionsResponse(
+    _ result: Result<[Session], RESTError>, state: inout State, reconcilePins: Bool
+  ) -> Effect<Action> {
+    switch result {
+    case let .success(sessions):
+      // Loading clears old errors; keep mutation failures raised during this fetch.
+      // Belt-and-suspenders: drop any session whose archive PATCH or DELETE is still in
+      // flight, so a fetch that completes during that window can't repopulate the removed row.
+      let inFlight = state.archivingIDs.union(state.deletingIDs)
+      let filtered = inFlight.isEmpty
+        ? sessions
+        : sessions.filter { !inFlight.contains($0.id) }
+      // The list AND search endpoints can return the same session id more than once
+      // (#78). `IdentifiedArray(uniqueElements:)` preconditions on unique ids and
+      // trapped in the field, so dedupe first — keep the FIRST occurrence (server order).
+      state.sessions = IdentifiedArray(filtered, uniquingIDsWith: { first, _ in first })
+      // Only an unfiltered response feeds the widgets' source. The list and search fetches
+      // share `CancelID.fetch` (cancel-in-flight), so the response landing now is the one
+      // the current query started: searching ⇔ a search response.
+      if !state.isSearching {
+        state.statusSessions = state.sessions
+      }
+      state.isLoading = state.awaitsCronJobs
+      let visible = state.sessions
+      // Seed last-seen counts for newly-discovered sessions so they don't all show as
+      // unread on first sight; only later increases flag unread.
+      var seeded = false
+      for session in visible where state.seenCounts[session.id] == nil {
+        state.seenCounts[session.id] = session.messageCount ?? 0
+        seeded = true
+      }
+      var effects: [Effect<Action>] = []
+      if seeded { effects.append(persistSeenCounts(state.seenCounts)) }
+      // Only a capable list reconciles membership. Search never imports pins or
+      // enrolls legacy migration, and absent/nil list rows leave pending IDs intact.
+      if reconcilePins && visible.contains(where: { $0.pinned != nil }) {
+        let oldPins = state.pinnedIDs
+        let server = state.pinMigrationServerID
+        var migration = preferences.loadPinMigration(server) ?? PinMigration(pendingIDs: oldPins)
+        migration.pendingIDs.removeAll { id in
+          visible[id: id]?.pinned == true && state.canChangePin(id: id)
+        }
+        // Upload only pins the user still has: a local-only unpin (server writes off this
+        // launch) leaves its id pending, and pushing it would re-pin it everywhere.
+        for session in visible where migration.pendingIDs.contains(session.id)
+          && state.pinnedIDs.contains(session.id)
+          && session.pinned == false && state.canChangePin(id: session.id) {
+          let mutation = PinMutation(pinned: true,
+            previousIndex: state.pinnedIDs.firstIndex(of: session.id),
+            profileName: state.selectedProfileName)
+          state.pinMutations[session.id] = mutation
+          effects.append(.run { [rest, connection = state.connection] send in
+            let error: RESTError?
+            do {
+              try await rest.setPinned(connection, session.id, true, mutation.profileName)
+              error = nil
+            } catch let failure { error = asRESTError(failure) }
+            await send(.pinMigrationFinished(server: server, id: session.id,
+              profileName: mutation.profileName, error: error))
+          })
+        }
+        // Persist before dispatch, but retire only explicit true or acknowledged writes.
+        preferences.savePinMigration(server, migration)
+        let pending = Set(migration.pendingIDs)
+        let unpinned = Set(visible.filter {
+          $0.pinned == false && !pending.contains($0.id) && state.pinMutations[$0.id] == nil
+        }.map(\.id))
+        state.pinnedIDs.removeAll { unpinned.contains($0) }
+        var membership = Set(state.pinnedIDs)
+        for session in visible where session.pinned == true && state.pinMutations[session.id] == nil {
+          if membership.insert(session.id).inserted { state.pinnedIDs.append(session.id) }
+        }
+        if state.pinnedIDs != oldPins { preferences.savePinnedIDs(state.pinnedIDs) }
+      }
+      return .merge(effects)
+
+    case let .failure(error):
+      state.isLoading = false
+      state.loadError = error.message
+      return .none
+
+    }
   }
 
   /// Refresh "now" + the section calendar, clear errors, and reload the non-secret persisted
-  /// prefs (seen counts, pins, swipe action). Shared by `.task` and `load()`
+  /// prefs (seen counts, pins, swipe action, tips dismissal). Shared by `.task` and `load()`
   /// — `.task` additionally reloads the selected profile before probing the profiles
   /// capability.
   private func reloadPrefs(_ state: inout State) {
@@ -1591,6 +1967,7 @@ public struct SessionListFeature {
     state.seenCounts = preferences.loadSeenCounts()
     state.pinnedIDs = preferences.loadPinnedIDs()
     state.defaultSwipeAction = preferences.loadDefaultSessionSwipeAction()
+    state.showsOnboardingTips = !preferences.loadOnboardingTipsDismissed()
   }
 
   /// Refresh "now", clear errors, reload persisted prefs, and fetch the session list
@@ -1598,7 +1975,16 @@ public struct SessionListFeature {
   private func load(_ state: inout State) -> Effect<Action> {
     reloadPrefs(&state)
     state.isLoading = true
-    return .run { [
+    // The open job's runs refresh with every list load (poll, pull-to-refresh, the Run now
+    // success), alongside — never inside — the shared-`fetch` list effect. Only while the
+    // Cron Jobs tab is on screen (never on the Sessions tab or while searching).
+    let runs = state.effectiveTab == .cron ? fetchExpandedCronRuns(state) : .none
+    return .merge(runs, loadList(state))
+  }
+
+  /// The list (+ jobs) half of `load`, on the shared `fetch` id.
+  private func loadList(_ state: State) -> Effect<Action> {
+    .run { [
       rest, profiles, connection = state.connection, query = state.searchQuery,
       profile = state.scopedProfileName, cronJobsSupported = state.cronJobsSupported
     ] send in
@@ -1607,8 +1993,7 @@ public struct SessionListFeature {
       ))
       // Refresh the cron jobs in the SAME effect, after the list, so the two responses
       // arrive in a deterministic order (no racy merge). Skipped while searching (the
-      // section is hidden then) and once the agent proved it lacks the API. Scoped like the
-      // session list, so a job's runs are actually in `sessions`.
+      // section is hidden then) and once the agent proved it lacks the API.
       if cronJobsSupported, query.trimmingCharacters(in: .whitespaces).isEmpty {
         await send(fetchCronJobs(rest: rest, connection: connection, profile: profile))
       }
@@ -1665,32 +2050,81 @@ public struct SessionListFeature {
     }
   }
 
-  /// Whether the push info sheet is currently snoozed — a persisted `until` exists and `now`
-  /// is still before it. A cleared snooze (ready/logout) or an elapsed window returns `false`.
+  /// Whether the push card is currently snoozed — a persisted `until` exists and `now` is
+  /// still before it. A cleared snooze (authorized/logout) or an elapsed window returns `false`.
   private func isPushPromptSnoozed() -> Bool {
     guard let snooze = preferences.loadPushPromptSnooze() else { return false }
     return now < snooze.until
   }
 
-  /// Shared trigger/pause/resume flow: guard against a double-fire while the job's RPC is
-  /// in flight, then run it and funnel the outcome through `.cronJobActionFinished`.
+  /// Seed the Settings tab from the list's current facts. Fresh on every visit (the tab's
+  /// state is dropped on leave), so a profile switch, capability flip or pref change since
+  /// the last visit is always reflected. `connection` carries the auth session (the Auth row
+  /// / token-field gate read it).
+  private func seedSettings(_ state: inout State) {
+    state.settings = SettingsFeature.State(
+      connection: state.connection,
+      pushAvailable: state.pushAvailable,
+      defaultSwipeAction: state.defaultSwipeAction,
+      deleteSupported: state.deleteSupported,
+      liveActivityEnabled: preferences.loadLiveActivityEnabled(),
+      liveActivityShowsTitles: preferences.loadLiveActivityShowsTitles(),
+      profileName: state.scopedProfileName
+    )
+  }
+
+  /// Fetch the expanded job's recent runs (`GET /api/cron/jobs/{id}/runs`, capped to
+  /// `cronPeekLimit`, profile-scoped like the jobs fetch). A no-op with nothing expanded or
+  /// on an agent without the jobs API. `cancelInFlight` on its own id: a refresh or a switch
+  /// supersedes the previous fetch without touching the list load.
+  private func fetchExpandedCronRuns(_ state: State) -> Effect<Action> {
+    guard let jobID = state.expandedCronJobID, state.cronJobsSupported else { return .none }
+    return .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
+      await send(fetchCronRuns(rest: rest, connection: connection, jobID: jobID, profile: profile))
+    }
+    .cancellable(id: CancelID.cronRuns, cancelInFlight: true)
+  }
+
+  /// A jobs-only refetch, outside the list load (a cron action changed a job, not the list).
+  private func refetchCronJobs(_ state: State) -> Effect<Action> {
+    .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
+      await send(fetchCronJobs(rest: rest, connection: connection, profile: profile))
+    }
+  }
+
+  /// The banner for a confirmed delete that hits the job's in-flight guard.
+  static let cronJobBusyMessage = "Another action on this job is still running. Try again in a moment."
+
+  /// Collapse the expanded job: clear the id and its runs slot, and cancel a runs fetch in
+  /// flight. THE one collapse path (tap, the jobs-API 404 flip, profile switches, deleting
+  /// the expanded job, a jobs refetch that no longer lists it).
+  private func collapseExpandedCronJob(_ state: inout State) -> Effect<Action> {
+    state.expandedCronJobID = nil
+    state.expandedCronRuns = nil
+    state.expandedCronRunsFailed = false
+    return .cancel(id: CancelID.cronRuns)
+  }
+
+  /// Shared trigger/pause/resume/delete flow: guard against a double-fire while the job's
+  /// RPC is in flight, then run it and funnel the outcome through `.cronJobActionFinished`.
   /// Threads the same profile scoping as the jobs fetch (`scopedProfileName`).
   private func performCronAction(
     _ state: inout State,
     id: String,
-    refetchSessions: Bool,
+    kind: Action.CronJobActionKind,
     rpc: @escaping @Sendable (HermesRESTClient, ServerConnection, String, String?) async throws -> Void
   ) -> Effect<Action> {
     guard !state.cronActionInFlightIDs.contains(id) else { return .none }
     state.cronActionInFlightIDs.insert(id)
-    return .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
+    let profile = state.scopedProfileName
+    return .run { [rest, connection = state.connection] send in
       do {
         try await rpc(rest, connection, id, profile)
-        await send(.cronJobActionFinished(id: id, refetchSessions: refetchSessions, error: nil))
+        await send(.cronJobActionFinished(id: id, kind: kind, error: nil))
       } catch let error as RESTError {
-        await send(.cronJobActionFinished(id: id, refetchSessions: refetchSessions, error: error))
+        await send(.cronJobActionFinished(id: id, kind: kind, error: error))
       } catch {
-        await send(.cronJobActionFinished(id: id, refetchSessions: refetchSessions, error: .unreachable))
+        await send(.cronJobActionFinished(id: id, kind: kind, error: .unreachable))
       }
     }
   }
@@ -1708,10 +2142,6 @@ public struct SessionListFeature {
 
   private func persistSeenCounts(_ counts: [String: Int]) -> Effect<Action> {
     .run { [preferences] _ in preferences.saveSeenCounts(counts) }
-  }
-
-  private func persistPinnedIDs(_ ids: [String]) -> Effect<Action> {
-    .run { [preferences] _ in preferences.savePinnedIDs(ids) }
   }
 
   /// Build the profile array tolerating a duplicate `name` in the server response (keep
@@ -1751,6 +2181,26 @@ private func fetchCronJobs(
     return .cronJobsResponse(.failure(error))
   } catch {
     return .cronJobsResponse(.failure(.unreachable))
+  }
+}
+
+/// Fetch one job's recent runs (capped to `cronPeekLimit`) and map to a response tagged with
+/// the job, so a late answer for a job no longer expanded is dropped.
+private func fetchCronRuns(
+  rest: HermesRESTClient,
+  connection: ServerConnection,
+  jobID: String,
+  profile: String?
+) async -> SessionListFeature.Action {
+  do {
+    let runs = try await rest.cronJobRuns(
+      connection, jobID, profile, SessionListFeature.State.cronPeekLimit
+    )
+    return .cronRunsResponse(jobID: jobID, .success(runs))
+  } catch let error as RESTError {
+    return .cronRunsResponse(jobID: jobID, .failure(error))
+  } catch {
+    return .cronRunsResponse(jobID: jobID, .failure(.unreachable))
   }
 }
 

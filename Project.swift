@@ -17,7 +17,7 @@ let developmentTeam = Environment.developmentTeam.getString(default: "")
 // validation rejects an embedded extension whose CFBundleVersion differs) — bump the build
 // number here, once, for both targets.
 let marketingVersion: SettingValue = "1.0"
-let currentProjectVersion: SettingValue = "86"
+let currentProjectVersion: SettingValue = "93"
 
 let appBundleIdentifier = "com.taquitos.HermesMobile"
 
@@ -68,7 +68,9 @@ let project = Project(
         "NSAppTransportSecurity": [
           "NSAllowsArbitraryLoads": true,
         ],
-        // On device, reaching a private/tailnet host can trigger the local-network prompt.
+        // On device, the first request to a same-Wi-Fi (LAN/Bonjour) address triggers iOS's
+        // Local Network prompt. Tailscale/VPN traffic does not (TN3179: a local network is a
+        // broadcast-capable interface, not cellular or VPN). The string stays broad on purpose.
         "NSLocalNetworkUsageDescription": "Hermes Mobile connects to your self-hosted Hermes server over your private network or Tailscale.",
         // Voice input records a short clip that's transcribed by your Hermes server.
         "NSMicrophoneUsageDescription": "Hermes Mobile records your voice so it can be transcribed into a message by your Hermes server.",

@@ -104,6 +104,16 @@ public enum GatewayError: Error, Equatable, Sendable {
     return false
   }
 
+  /// True for the gateway's 4010 `agent does not support steer`: the method exists but this
+  /// session's agent has no `steer()`. Matched on the stable text like `isUnknownMethod`
+  /// (`InboundFrame` keeps only the message). Flips the per-slot `steerSupported` off.
+  public var isSteerUnsupported: Bool {
+    if case let .server(message) = self {
+      return message.lowercased().hasPrefix("agent does not support steer")
+    }
+    return false
+  }
+
   /// True when the socket dropped (no transport) — distinct from a server-side protocol
   /// error. A dropped socket is already surfaced by the reducer's `.reconnecting` status, so
   /// callers can avoid raising a redundant "Connection lost." banner that would linger past
@@ -129,10 +139,33 @@ public enum GatewayError: Error, Equatable, Sendable {
   /// `"session not found"` text (case-insensitive) — used to self-heal outbound RPCs by
   /// transparently re-resuming for a fresh live id and replaying the call (#17). Mirrors
   /// `isUnknownMethod`.
+  /// A session-authority host refused a `session.mutate` because its fences moved
+  /// (`revision_conflict` / `stale_generation`, #157): nothing was written; re-read and retry.
+  public var isStaleFence: Bool {
+    if case let .server(message) = self {
+      return message == "revision_conflict" || message == "stale_generation"
+    }
+    return false
+  }
+
+  /// A canonical session-authority host (`gateway.ready.session_authority: true`, v0.22.3+)
+  /// never sends that text: its refusal is `{code: 4001, message: <reason>}`, and a session
+  /// it has no row for is the bare reason `not_found` (#166), matched exactly.
   public var isSessionNotFound: Bool {
     if case let .server(message) = self {
-      return message.lowercased().contains("session not found")
+      return message == "not_found" || message.lowercased().contains("session not found")
     }
+    return false
+  }
+
+  /// A session-authority host refused a `prompt.submit` with `permission_denied`: its
+  /// `submission()` raises that when THIS connection isn't attached to the session (a new
+  /// socket before its hydrate's `session.resume` lands, or after the server dropped the
+  /// subscription). A re-resume attaches it, so the submit heals like a not-found (#166).
+  /// The same reason also covers a real authz refusal, so it is healed ONLY on a submit, and
+  /// only once: a real refusal fails the replay and banners as before.
+  public var isSubmitUnattached: Bool {
+    if case let .server(message) = self { return message == "permission_denied" }
     return false
   }
 }

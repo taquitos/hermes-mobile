@@ -54,6 +54,8 @@ struct ChatView: View {
         model: store.model,
         reasoningEffort: store.reasoningEffort,
         usage: store.usage,
+        approvalMode: store.displayedApprovalMode,
+        approvalModePending: store.approvalModePending,
         recording: store.recording,
         waveformLevels: store.waveformLevels,
         recordingSeconds: store.recordingSeconds,
@@ -67,6 +69,7 @@ struct ChatView: View {
         autoSpeak: store.autoSpeakReplies,
         showsAutoSpeak: store.ttsSupported,
         onModelTap: { store.send(.modelChipTapped) },
+        onApprovalModeSelected: { store.send(.approvalModeSelected($0)) },
         onSend: { store.send(.composerSubmitted) },
         onInterrupt: { store.send(.interruptTapped) },
         onVoiceTap: { store.send(.voiceButtonTapped) },
@@ -388,6 +391,9 @@ struct ChatView: View {
         isParked: store.isQueueParked,
         composerHasDraft: !store.composerText
           .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.attachments.isEmpty,
+        canSteer: store.canSteerQueued,
+        onSteer: { store.send(.queuedPromptSteer(id: $0)) },
+        steeringID: store.steeringEntryID,
         onSendNow: { store.send(.queuedPromptSendNow(id: $0)) },
         onEdit: { store.send(.queuedPromptEditTapped(id: $0)) },
         onDelete: { store.send(.queuedPromptDeleted(id: $0)) }

@@ -610,6 +610,7 @@ public struct AppFeature {
         preferences.clearModelPickerPrefs()
         preferences.clearLiveActivityPrefs()
         preferences.clearOwnedAgentUpdate(nil)
+        preferences.clearOnboardingTipsDismissed() // the next sign-in shows the tips again (#136)
         debugLog.clear()
         state.connectionFailed = nil
         state.path = .init()
@@ -920,7 +921,7 @@ public struct AppFeature {
           for: chat.connection,
           // Whatever the onboarding screen last probed — empty after a launch auto-restore,
           // which `providerLabel` handles by falling back to the wire provider name.
-          oauthProviders: state.onboarding.capability?.oauthProviders ?? []
+          oauthProviders: state.onboarding.lastProbedCapability?.oauthProviders ?? []
         )
         return .none
 
@@ -988,6 +989,7 @@ public struct AppFeature {
         preferences.clearModelPickerPrefs()
         preferences.clearLiveActivityPrefs()
         preferences.clearOwnedAgentUpdate(nil)
+        preferences.clearOnboardingTipsDismissed() // the next sign-in shows the tips again (#136)
         debugLog.clear()
         state.reauth = nil
         state.path = .init()
@@ -1022,13 +1024,23 @@ public struct AppFeature {
         // under its parent) once its DB row exists server-side — an abandoned branch
         // simply never appears (documented v1 behavior, no optimistic insert).
         guard let home = state.home else { return .none }
+        // A seedless (session-authority, #159) child lives in the SOURCE chat's profile, which
+        // can differ from the sidebar's after a profile switch kept that chat open: resuming it
+        // under the sidebar's profile would miss its state.db and start an unrelated session.
+        let profile = creation.seed == nil
+          ? (state.liveChat?.profileName ?? home.scopedProfileName)
+          : home.scopedProfileName
         var chat = ChatFeature.State(
           connection: home.connection,
           resumeStoredID: creation.handle.storedSessionID,
-          profileName: home.scopedProfileName
+          profileName: profile
         )
-        chat.attachLiveSessionID = creation.handle.sessionID
-        chat.branchSeed = creation.seed
+        // A session-authority branch (#159, no seed) is already a persisted copy: it opens by
+        // stored id like any list row.
+        if let seed = creation.seed {
+          chat.attachLiveSessionID = creation.handle.sessionID
+          chat.branchSeed = seed
+        }
         let reload: Effect<Action> = .send(.home(.pulledToRefresh))
         guard state.liveChat != nil else {
           seatLiveChat(chat, into: &state)
@@ -1308,6 +1320,22 @@ public struct AppFeature {
           syncMirror(status, state, debounced: true),
           syncLiveActivity(status, &state, previous == nil ? .restamp : .debounced)
         )
+      }
+    }
+    // Every route that opens a chat leaves the Settings tab: `AppView` layers Settings over
+    // the WHOLE split view, so the chat (a compact marker, or the regular detail seat — even
+    // an in-place hydrate of the seated session) would otherwise land hidden under it. Sent
+    // as a list ACTION, never a direct nil-out, so the list's `ifLet` cancels Settings'
+    // effects. Evaluated after the routing itself; a route that stashes (no home yet) or
+    // finds nothing to open still just lands on Sessions.
+    Reduce { state, action in
+      switch action {
+      case .pushTapped, .launchIntentReceived,
+           .home(.delegate(.openSession)), .home(.delegate(.createSession)):
+        guard state.home?.effectiveTab == .settings else { return .none }
+        return .send(.home(.selectTab(.sessions)))
+      default:
+        return .none
       }
     }
   }
@@ -1854,7 +1882,9 @@ public struct AppFeature {
     SessionListFeature.State(
       connection: connection,
       selectedProfileName: SessionListFeature.State.persistedProfileName(preferences),
-      profilesSupported: SessionListFeature.State.persistedProfilesSupported(preferences)
+      profilesSupported: SessionListFeature.State.persistedProfilesSupported(preferences),
+      // Seeded here too (not only on the list's `.task`) so hidden tips never flash.
+      showsOnboardingTips: !preferences.loadOnboardingTipsDismissed()
     )
   }
 
@@ -2068,9 +2098,9 @@ public struct AppFeature {
   }
 
   /// The prefilled-onboarding landing for a connection that needs *editing* rather than
-  /// retrying: token mode prefills both fields so the user can fix them; cookie and bearer
-  /// mode prefill only the URL (neither a password nor a browser leg is persistable), so the
-  /// user re-authenticates. Shared by the launch auth-failure fallback and the retry screen's
+  /// retrying: the Server step auto-probes the stored URL, and token mode prefills the token
+  /// into the Sign in step it pushes; cookie and bearer mode prefill nothing more (neither a
+  /// password nor a browser leg is persistable), so the user re-authenticates. Shared by the launch auth-failure fallback and the retry screen's
   /// `.credentialsRejected` delegate, so onboarding is constructed in exactly one place.
   ///
   /// Only the bearer regime has an effect: this is a verdict that the stored pair is DEAD, so
@@ -2081,8 +2111,8 @@ public struct AppFeature {
     _ state: inout State, connection: ServerConnection
   ) -> Effect<Action> {
     state.onboarding = ConnectionFeature.State(
-      serverURL: connection.baseURL.absoluteString,
-      token: connection.auth.token ?? ""
+      recovering: connection.baseURL,
+      token: connection.auth.token
     )
     guard case .bearer = connection.auth else { return .none }
     let claim = bearerTokens.claimOwnership() // minted here, applied on the next tick

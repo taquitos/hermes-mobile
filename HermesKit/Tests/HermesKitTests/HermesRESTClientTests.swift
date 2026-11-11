@@ -95,6 +95,21 @@ final class MockURLProtocol: URLProtocol {
   }
 }
 
+/// Answers every request with a plain `URLResponse` (not HTTP) and an empty body.
+private final class NonHTTPURLProtocol: URLProtocol {
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func stopLoading() {}
+
+  override func startLoading() {
+    let response = URLResponse(
+      url: request.url!, mimeType: nil, expectedContentLength: 0, textEncodingName: nil
+    )
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+}
+
 /// Read a (possibly streamed) request body back as `Data` — `URLProtocol` turns `httpBody`
 /// into a stream. Shared by the REST/profile/native-flow suites.
 func mockRequestBody(_ req: URLRequest) -> Data {
@@ -206,9 +221,83 @@ struct HermesRESTClientTests {
     #expect(MockURLProtocol.lastRequest?.url?.path == "/api/status")
   }
 
+  // MARK: probeStatus (#136)
+
+  @Test func probeStatusDecodesA2xx() async throws {
+    MockURLProtocol.set(json: #"{"version":"0.16.0","auth_required":true,"auth_providers":["basic"]}"#)
+    let status = try await makeClient().probeStatus(baseURL).get()
+    #expect(status.version == "0.16.0")
+    #expect(status.authRequired == true)
+    #expect(status.authProviders == ["basic"])
+    let req = try #require(MockURLProtocol.lastRequest)
+    #expect(req.url?.absoluteString == "http://test.local:9119/api/status")
+    #expect(req.value(forHTTPHeaderField: "X-Hermes-Session-Token") == nil)
+    #expect(req.value(forHTTPHeaderField: "Authorization") == nil)
+    // Short, so an unreachable host fails per candidate in seconds, not the default minute.
+    #expect(req.timeoutInterval == 10)
+  }
+
+  /// Every Hermes `/api/status` reports its `version`; another service's JSON (an empty
+  /// object, a generic health check) is not Hermes.
+  @Test(arguments: ["{}", #"{"status":"ok"}"#, #"{"gateway_running":true}"#])
+  func probeStatusJSONWithoutAVersionIsNotHermes(body: String) async {
+    MockURLProtocol.set(json: body, headers: ["Content-Type": "application/json"])
+    #expect(await makeClient().probeStatus(baseURL) == .failure(.notHermes(httpStatus: 200)))
+  }
+
+  @Test func probeStatusHTMLOn2xxIsNotHermes() async {
+    MockURLProtocol.set(
+      json: "<!doctype html><html><body>Welcome to nginx!</body></html>",
+      headers: ["Content-Type": "text/html; charset=utf-8"]
+    )
+    #expect(await makeClient().probeStatus(baseURL) == .failure(.notHermes(httpStatus: 200)))
+  }
+
+  @Test func probeStatus404IsNotHermes() async {
+    MockURLProtocol.set(
+      status: 404, json: #"{"detail":"Not Found"}"#, headers: ["Content-Type": "application/json"]
+    )
+    #expect(await makeClient().probeStatus(baseURL) == .failure(.notHermes(httpStatus: 404)))
+  }
+
+  @Test func probeStatus400InvalidHostIsHostRejected() async {
+    let detail = "Invalid Host header. Dashboard requests must use the hostname the server was bound to."
+    MockURLProtocol.set(
+      status: 400, json: #"{"detail":"\#(detail)"}"#, headers: ["Content-Type": "application/json"]
+    )
+    #expect(await makeClient().probeStatus(baseURL) == .failure(.hostRejected(detail: detail)))
+  }
+
+  @Test func probeStatusOther400KeepsTheServerCopy() async {
+    MockURLProtocol.set(status: 400, json: #"{"detail":"Bad request"}"#)
+    #expect(await makeClient().probeStatus(baseURL) == .failure(.httpError("Bad request")))
+  }
+
+  @Test(arguments: [
+    (URLError.Code.cannotFindHost, ProbeFailure.hostNotFound),
+    (.cannotConnectToHost, .refused),
+    (.timedOut, .timedOut),
+    (.serverCertificateUntrusted, .untrustedCertificate),
+    (.notConnectedToInternet, .offline),
+  ])
+  func probeStatusClassifiesTransportErrors(code: URLError.Code, expected: ProbeFailure) async {
+    MockURLProtocol.set(fail: true, failCode: code)
+    #expect(await makeClient().probeStatus(baseURL) == .failure(expected))
+  }
+
+  @Test func probeStatusNonHTTPResponseIsRequestFailed() async {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [NonHTTPURLProtocol.self]
+    let client = HermesRESTClient.live(session: URLSession(configuration: config))
+    #expect(
+      await client.probeStatus(baseURL)
+        == .failure(.requestFailed("The server sent a response that isn’t HTTP."))
+    )
+  }
+
   @Test func sessionsMapsListToDomain() async throws {
     MockURLProtocol.set(json: #"""
-    {"sessions":[{"id":"20260610_120231_afcca6","title":"My chat","preview":"hello there","last_active":1749556800.0,"started_at":1749550000.0,"message_count":4,"unread":true,"cwd":"/Users/me/dev/hermes-mobile","is_active":true,"archived":false}],"total":1,"limit":20,"offset":0}
+    {"sessions":[{"id":"20260610_120231_afcca6","title":"My chat","preview":"hello there","last_active":1749556800.0,"started_at":1749550000.0,"message_count":4,"unread":true,"pinned":true,"cwd":"/Users/me/dev/hermes-mobile","is_active":true,"archived":false}],"total":1,"limit":20,"offset":0}
     """#)
     let sessions = try await makeClient().sessions(connection, 20, 0, .recent, .all)
     #expect(sessions.count == 1)
@@ -220,6 +309,26 @@ struct HermesRESTClientTests {
     #expect(s.cwd == "/Users/me/dev/hermes-mobile")
     #expect(s.startedAt == Date(timeIntervalSince1970: 1749550000.0))
     #expect(s.unread == true)
+    #expect(s.pinned == true)
+  }
+
+  /// The profile-scoped list and the legacy list share this row mapping.
+  @Test func sessionsDecodesExplicitUnpinnedFlag() async throws {
+    MockURLProtocol.set(json: #"{"sessions":[{"id":"sid","pinned":false}]}"#)
+    let session = try #require(try await makeClient().sessions(connection, 20, 0, .recent, .interactive).first)
+    #expect(session.pinned == false)
+  }
+
+  @Test func sessionsDecodesAbsentPinnedAsNil() async throws {
+    MockURLProtocol.set(json: #"{"sessions":[{"id":"sid"}]}"#)
+    let session = try #require(try await makeClient().sessions(connection, 20, 0, .recent, .interactive).first)
+    #expect(session.pinned == nil)
+  }
+
+  @Test func sessionsDecodesNullPinnedAsNil() async throws {
+    MockURLProtocol.set(json: #"{"sessions":[{"id":"sid","pinned":null}]}"#)
+    let session = try #require(try await makeClient().sessions(connection, 20, 0, .recent, .interactive).first)
+    #expect(session.pinned == nil)
   }
 
   @Test func sessionsDecodesCronSource() async throws {
@@ -420,6 +529,18 @@ struct HermesRESTClientTests {
     #expect(query == [URLQueryItem(name: "q", value: "matched")])
   }
 
+  @Test(arguments: ["true", "false", "null", "omitted"])
+  func searchDecodesOptionalPinnedField(value: String) async throws {
+    let field = value == "omitted" ? "" : ",\"pinned\":\(value)"
+    MockURLProtocol.set(json: "{\"results\":[{\"session_id\":\"sid\"\(field)}]}")
+    let results = try await makeClient().search(connection, "matched", "default")
+    let session = try #require(results.first)
+    let expected: Bool? = value == "true" ? true : value == "false" ? false : nil
+    #expect(results.count == 1)
+    #expect(session.id == "sid")
+    #expect(session.pinned == expected)
+  }
+
   @Test func searchThreadsLiteralProfileIntoQuery() async throws {
     MockURLProtocol.set(json: #"{"results":[]}"#)
     _ = try await makeClient().search(connection, "matched", "default")
@@ -455,6 +576,53 @@ struct HermesRESTClientTests {
     } ?? Data()
     let json = try JSONSerialization.jsonObject(with: body) as? [String: Bool]
     #expect(json == ["archived": true])
+  }
+
+  @Test(arguments: [true, false])
+  func setPinnedSendsProfileScopedPatchWithBooleanBody(pinned: Bool) async throws {
+    MockURLProtocol.set(status: 200)
+    try await makeClient().setPinned(connection, "sid", pinned, "work")
+
+    let request = try #require(MockURLProtocol.lastRequest)
+    #expect(request.httpMethod == "PATCH")
+    #expect(request.url?.path == "/api/sessions/sid")
+    #expect(request.url?.query == "profile=work")
+    let body = try #require(JSONSerialization.jsonObject(with: mockRequestBody(request)) as? [String: Any])
+    #expect(body["pinned"] as? Bool == pinned)
+    #expect(body["profile"] as? String == "work")
+  }
+
+  @Test func setPinnedWithOmittedProfileSendsFalse() async throws {
+    MockURLProtocol.set(status: 200)
+    try await makeClient().setPinned(connection, "sid", false, nil)
+
+    let request = try #require(MockURLProtocol.lastRequest)
+    #expect(request.httpMethod == "PATCH")
+    #expect(request.url?.path == "/api/sessions/sid")
+    #expect(request.url?.query == nil)
+    let body = try #require(JSONSerialization.jsonObject(with: mockRequestBody(request)) as? [String: Any])
+    #expect(body["pinned"] as? Bool == false)
+    #expect(body["profile"] == nil)
+  }
+
+  @Test func setPinnedWithExplicitDefaultProfileIncludesProfileInBody() async throws {
+    MockURLProtocol.set(status: 200)
+    try await makeClient().setPinned(connection, "sid", true, "default")
+
+    let request = try #require(MockURLProtocol.lastRequest)
+    #expect(request.httpMethod == "PATCH")
+    #expect(request.url?.path == "/api/sessions/sid")
+    #expect(request.url?.query == "profile=default")
+    let body = try #require(JSONSerialization.jsonObject(with: mockRequestBody(request)) as? [String: Any])
+    #expect(body["pinned"] as? Bool == true)
+    #expect(body["profile"] as? String == "default")
+  }
+
+  @Test func setPinnedMapsUnsupportedEndpointStatus() async throws {
+    MockURLProtocol.set(status: 405)
+    await #expect(throws: RESTError.server(status: 405)) {
+      try await makeClient().setPinned(connection, "sid", true, nil)
+    }
   }
 
   @Test func setUnreadSendsSharedReadStatePatchWithProfileScope() async throws {
@@ -1277,6 +1445,124 @@ struct HermesRESTClientTests {
     MockURLProtocol.set(status: 404)
     await #expect(throws: RESTError.notFound) {
       try await makeClient().triggerCronJob(connection, "gone", nil)
+    }
+  }
+
+  @Test func triggerStillPostsAnEmptyObjectBody() async throws {
+    // Regression for the method-aware `cronJobAction`: the POST actions keep their `{}` body.
+    MockURLProtocol.set(json: "{}")
+    try await makeClient().triggerCronJob(connection, "abc", "work")
+    let req = try #require(MockURLProtocol.lastRequest)
+    #expect(req.httpMethod == "POST")
+    #expect(req.url?.path == "/api/cron/jobs/abc/trigger")
+    #expect(req.url?.query == "profile=work")
+    #expect(mockRequestBody(req) == Data("{}".utf8))
+  }
+
+  // MARK: Cron job delete
+
+  @Test func deleteCronJobSendsDeleteWithoutBody() async throws {
+    MockURLProtocol.set(json: #"{"ok":true}"#)
+    try await makeClient().deleteCronJob(connection, "a1b2c3d4e5f6", nil)
+    let req = try #require(MockURLProtocol.lastRequest)
+    #expect(req.httpMethod == "DELETE")
+    #expect(req.url?.path == "/api/cron/jobs/a1b2c3d4e5f6")
+    #expect(req.url?.query == nil)
+    #expect(mockRequestBody(req).isEmpty)
+    #expect(req.value(forHTTPHeaderField: "X-Hermes-Session-Token") == "tok")
+  }
+
+  @Test func deleteCronJobThreadsProfileInQuery() async throws {
+    MockURLProtocol.set(json: #"{"ok":true}"#)
+    try await makeClient().deleteCronJob(connection, "abc", "default")
+    #expect(MockURLProtocol.lastRequest?.url?.path == "/api/cron/jobs/abc")
+    #expect(MockURLProtocol.lastRequest?.url?.query == "profile=default")
+  }
+
+  @Test func deleteCronJobNotFoundThrows() async throws {
+    MockURLProtocol.set(status: 404, json: #"{"detail":"Job not found"}"#)
+    await #expect(throws: RESTError.notFound) {
+      try await makeClient().deleteCronJob(connection, "gone", nil)
+    }
+  }
+
+  @Test func deleteCronJobBadIDSurfacesDetail() async throws {
+    MockURLProtocol.set(status: 400, json: #"{"detail":"Invalid job id"}"#)
+    await #expect(throws: RESTError.server(status: 400, detail: "Invalid job id")) {
+      try await makeClient().deleteCronJob(connection, "../x", nil)
+    }
+  }
+
+  // MARK: Cron job runs
+
+  @Test func cronJobRunsRequestsRunsPathWithLimit() async throws {
+    MockURLProtocol.set(json: #"{"runs":[],"limit":5}"#)
+    let runs = try await makeClient().cronJobRuns(connection, "a1b2c3d4e5f6", nil, 5)
+    #expect(runs.isEmpty)
+    let req = try #require(MockURLProtocol.lastRequest)
+    #expect(req.httpMethod == "GET")
+    #expect(req.url?.path == "/api/cron/jobs/a1b2c3d4e5f6/runs")
+    // nil profile → only `limit`, no `profile` param.
+    #expect(req.url?.query == "limit=5")
+    #expect(req.value(forHTTPHeaderField: "X-Hermes-Session-Token") == "tok")
+  }
+
+  @Test func cronJobRunsThreadsProfileAndLimit() async throws {
+    MockURLProtocol.set(json: #"{"runs":[],"limit":20}"#)
+    _ = try await makeClient().cronJobRuns(connection, "abc", "work", 20)
+    let items = URLComponents(
+      url: try #require(MockURLProtocol.lastRequest?.url), resolvingAgainstBaseURL: false
+    )?.queryItems ?? []
+    #expect(items.contains(URLQueryItem(name: "limit", value: "20")))
+    #expect(items.contains(URLQueryItem(name: "profile", value: "work")))
+    #expect(items.count == 2)
+  }
+
+  @Test func cronJobRunsDecodesSessionAndScriptRows() async throws {
+    MockURLProtocol.set(json: #"""
+    {"runs":[
+      {"id":"local-1a2b3c","title":"Morning digest","source":"cron","started_at":1762588800.0,"last_active":1762588860.0,"message_count":4,"unread":true},
+      {"id":"cron_output:abc:2026-11-08_08-00-00","title":"OK","preview":"done","source":"cron_output","started_at":1762502400.0,"last_active":1762502400.0,"message_count":0,"is_active":false,"model":null,"cwd":null}
+    ],"limit":5}
+    """#)
+    let runs = try await makeClient().cronJobRuns(connection, "abc", nil, 5)
+    #expect(runs.map(\.id) == ["local-1a2b3c", "cron_output:abc:2026-11-08_08-00-00"])
+    #expect(runs[0].isCron == true)
+    #expect(runs[0].unread == true)
+    #expect(runs[0].updatedAt == Date(timeIntervalSince1970: 1762588860))
+    #expect(runs[1].source == "cron_output")
+    #expect(runs[1].isCron == false)
+    #expect(runs[1].startedAt == Date(timeIntervalSince1970: 1762502400))
+  }
+
+  @Test func cronJobRunsDropsRowWithoutID() async throws {
+    MockURLProtocol.set(json: #"""
+    {"runs":[
+      {"id":"local-1","source":"cron","started_at":1762588800.0},
+      {"title":"OK","source":"cron_output","started_at":1762502400.0},
+      {"id":"local-2","source":"cron","started_at":1762416000.0}
+    ],"limit":5}
+    """#)
+    let runs = try await makeClient().cronJobRuns(connection, "abc", nil, 5)
+    #expect(runs.map(\.id) == ["local-1", "local-2"])
+  }
+
+  @Test func cronJobRunsMissingRunsKeyYieldsEmpty() async throws {
+    MockURLProtocol.set(json: #"{"limit":5}"#)
+    let runs = try await makeClient().cronJobRuns(connection, "abc", nil, 5)
+    #expect(runs.isEmpty)
+  }
+
+  @Test func cronJobRunsNullRunsYieldsEmpty() async throws {
+    MockURLProtocol.set(json: #"{"runs":null}"#)
+    let runs = try await makeClient().cronJobRuns(connection, "abc", nil, 5)
+    #expect(runs.isEmpty)
+  }
+
+  @Test func cronJobRunsNotFoundThrows() async throws {
+    MockURLProtocol.set(status: 404)
+    await #expect(throws: RESTError.notFound) {
+      _ = try await makeClient().cronJobRuns(connection, "gone", nil, 5)
     }
   }
 }

@@ -310,6 +310,8 @@ public struct SessionInfo: Equatable, Sendable, Decodable {
   public var version: String?
   public var cwd: String?
   public var profileName: String?
+  /// Raw wire value so a future policy does not break decoding the entire session.
+  public var approvalMode: String?
   public var usage: Usage?
   /// The session's live title. Deliberately read in ONE place: the post-slash
   /// server-authoritative refresh (`.slashHistoryRefreshed`) applies it on top of
@@ -322,18 +324,26 @@ public struct SessionInfo: Equatable, Sendable, Decodable {
   /// as one, else nil. It must NEVER throw: `ActivateResponse` decodes `info` with `try?`,
   /// so a throw here would drop the model/usage fields along with it.
   public var desktopContract: Int?
+  /// A session-authority host's CAS fences (`revision`, `execution_generation`), carried by its
+  /// `session.info` fan-out: turns bump the revision without any other event, so this is where
+  /// the next `session.mutate` learns what to present (#157). Lenient; nil on legacy hosts.
+  public var revision: Int?
+  public var executionGeneration: Int?
 
   enum CodingKeys: String, CodingKey {
-    case model, provider, running, version, cwd, usage, title
+    case model, provider, running, version, cwd, usage, title, revision
     case reasoningEffort = "reasoning_effort"
     case profileName = "profile_name"
     case desktopContract = "desktop_contract"
+    case approvalMode = "approval_mode"
+    case executionGeneration = "execution_generation"
   }
 
   public init(
     model: String? = nil, provider: String? = nil, reasoningEffort: String? = nil,
     running: Bool? = nil, version: String? = nil, cwd: String? = nil, profileName: String? = nil,
-    usage: Usage? = nil, title: String? = nil, desktopContract: Int? = nil
+    usage: Usage? = nil, title: String? = nil, desktopContract: Int? = nil,
+    revision: Int? = nil, executionGeneration: Int? = nil, approvalMode: String? = nil
   ) {
     self.model = model
     self.provider = provider
@@ -345,6 +355,9 @@ public struct SessionInfo: Equatable, Sendable, Decodable {
     self.usage = usage
     self.title = title
     self.desktopContract = desktopContract
+    self.revision = revision
+    self.executionGeneration = executionGeneration
+    self.approvalMode = approvalMode
   }
 
   /// Hand-written only for the lenient `desktopContract` / `provider` decodes; every other field
@@ -361,6 +374,9 @@ public struct SessionInfo: Equatable, Sendable, Decodable {
     usage = try c.decodeIfPresent(Usage.self, forKey: .usage)
     title = try c.decodeIfPresent(String.self, forKey: .title)
     desktopContract = Self.lenientContract(c)
+    revision = (try? c.decodeIfPresent(Int.self, forKey: .revision)) ?? nil
+    executionGeneration = (try? c.decodeIfPresent(Int.self, forKey: .executionGeneration)) ?? nil
+    approvalMode = try c.decodeIfPresent(String.self, forKey: .approvalMode)
   }
 
   private static func lenientContract(_ c: KeyedDecodingContainer<CodingKeys>) -> Int? {

@@ -23,6 +23,9 @@ public struct Session: Equatable, Sendable, Identifiable {
   /// mobile client. Nil means an older agent omitted the field; the list then falls back
   /// to this device's message-count watermark.
   public var unread: Bool?
+  /// Server-backed pin state shared with Desktop. Nil means the server omitted the field;
+  /// callers must not infer unpinned from an absent value or an absent row.
+  public var pinned: Bool?
   /// Whether the session is currently active (a turn ran recently).
   public var isActive: Bool?
   /// Where the session originated (`cron`, `cli`, `telegram`, `discord`, `slack`,
@@ -54,6 +57,7 @@ public struct Session: Equatable, Sendable, Identifiable {
     startedAt: Date? = nil,
     messageCount: Int? = nil,
     unread: Bool? = nil,
+    pinned: Bool? = nil,
     isActive: Bool? = nil,
     source: String? = nil,
     parentSessionID: String? = nil,
@@ -68,6 +72,7 @@ public struct Session: Equatable, Sendable, Identifiable {
     self.startedAt = startedAt
     self.messageCount = messageCount
     self.unread = unread
+    self.pinned = pinned
     self.isActive = isActive
     self.source = source
     self.parentSessionID = parentSessionID
@@ -111,17 +116,32 @@ public struct SessionHandle: Equatable, Sendable, Decodable {
   /// Persisted id (e.g. `20260610_120231_afcca6`); the id REST lists.
   public var storedSessionID: String?
   public var messageCount: Int?
+  /// Lazy create carries capability info before the agent is built.
+  public var info: SessionInfo?
 
   enum CodingKeys: String, CodingKey {
     case sessionID = "session_id"
     case storedSessionID = "stored_session_id"
     case messageCount = "message_count"
+    case info
   }
 
-  public init(sessionID: String, storedSessionID: String? = nil, messageCount: Int? = nil) {
+  public init(
+    sessionID: String, storedSessionID: String? = nil, messageCount: Int? = nil,
+    info: SessionInfo? = nil
+  ) {
     self.sessionID = sessionID
     self.storedSessionID = storedSessionID
     self.messageCount = messageCount
+    self.info = info
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    sessionID = try c.decode(String.self, forKey: .sessionID)
+    storedSessionID = try c.decodeIfPresent(String.self, forKey: .storedSessionID)
+    messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount)
+    info = try? c.decodeIfPresent(SessionInfo.self, forKey: .info)
   }
 }
 
@@ -140,17 +160,26 @@ public struct SessionInflight: Equatable, Sendable, Decodable {
   /// model-facing text, so the seed must not paint it as the user's bubble.
   public var displayKind: String?
   public var displayMetadata: JSONValue?
+  /// Steers accepted into this turn (`corrections`), in arrival order, trimmed, blanks dropped.
+  /// Their own user bubbles, never written over `user` (gateway `_record_inflight_correction`).
+  public var corrections: [String]
+  /// Per correction, how much of `assistant` (in Unicode scalars, Python `len`) had streamed
+  /// when it arrived (`correction_offsets`): where its bubble sits. `nil` unless every
+  /// correction has a usable offset (desktop `correctionOffsetsUsable`).
+  public var correctionOffsets: [Int]?
 
   enum CodingKeys: String, CodingKey {
-    case user, assistant, streaming
+    case user, assistant, streaming, corrections
     case startedAt = "started_at"
     case displayKind = "display_kind"
     case displayMetadata = "display_metadata"
+    case correctionOffsets = "correction_offsets"
   }
 
   public init(
     user: String? = nil, assistant: String? = nil, streaming: Bool? = nil, startedAt: Date? = nil,
-    displayKind: String? = nil, displayMetadata: JSONValue? = nil
+    displayKind: String? = nil, displayMetadata: JSONValue? = nil,
+    corrections: [String] = [], correctionOffsets: [Int]? = nil
   ) {
     self.user = user
     self.assistant = assistant
@@ -158,6 +187,8 @@ public struct SessionInflight: Equatable, Sendable, Decodable {
     self.startedAt = startedAt
     self.displayKind = displayKind
     self.displayMetadata = displayMetadata
+    self.corrections = corrections
+    self.correctionOffsets = correctionOffsets
   }
 
   public init(from decoder: Decoder) throws {
@@ -169,6 +200,19 @@ public struct SessionInflight: Equatable, Sendable, Decodable {
     self.startedAt = seconds.flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
     self.displayKind = (try? c.decodeIfPresent(String.self, forKey: .displayKind))?.trimmedNonEmpty
     self.displayMetadata = decodeDisplayMetadata(c, forKey: .displayMetadata)
+    // Lenient: a malformed list reads as none, never failing the whole hydrate.
+    let rawCorrections = (try? c.decodeIfPresent([JSONValue].self, forKey: .corrections)) ?? nil
+    let rawOffsets = (try? c.decodeIfPresent([JSONValue].self, forKey: .correctionOffsets)) ?? nil
+    var corrections: [String] = []
+    var offsets: [Int?] = []
+    for (index, raw) in (rawCorrections ?? []).enumerated() {
+      guard let text = raw.stringValue?.trimmedNonEmpty else { continue }
+      corrections.append(text)
+      offsets.append(rawOffsets.flatMap { index < $0.count ? $0[index].intValue : nil }.flatMap { $0 >= 0 ? $0 : nil })
+    }
+    self.corrections = corrections
+    let usable = offsets.compactMap { $0 }
+    self.correctionOffsets = !corrections.isEmpty && usable.count == corrections.count ? usable : nil
   }
 }
 
@@ -199,6 +243,8 @@ public struct ActivateResponse: Equatable, Sendable, Decodable {
   /// Present on a live reattach (`session.resume` / `session.activate`) when non-empty;
   /// absent → `[]`. Decoded per entry: a malformed entry is dropped, the rest kept.
   public var openRequests: [OpenRequest]
+  /// The canonical snapshot's CAS fences (session-authority hosts, #157); nil on legacy hosts.
+  public var fences: SessionFences?
 
   enum CodingKeys: String, CodingKey {
     case sessionID = "session_id"
@@ -211,12 +257,14 @@ public struct ActivateResponse: Equatable, Sendable, Decodable {
     case sessionKey = "session_key"
     case messages, info, running, inflight
     case openRequests = "open_requests"
+    case revision
+    case executionGeneration = "execution_generation"
   }
 
   public init(
     sessionID: String, storedSessionID: String? = nil, messages: [SessionMessage] = [],
     info: SessionInfo? = nil, running: Bool? = nil, inflight: SessionInflight? = nil,
-    openRequests: [OpenRequest] = []
+    openRequests: [OpenRequest] = [], fences: SessionFences? = nil
   ) {
     self.sessionID = sessionID
     self.storedSessionID = storedSessionID
@@ -225,6 +273,7 @@ public struct ActivateResponse: Equatable, Sendable, Decodable {
     self.running = running
     self.inflight = inflight
     self.openRequests = openRequests
+    self.fences = fences
   }
 
   public init(from decoder: Decoder) throws {
@@ -243,6 +292,26 @@ public struct ActivateResponse: Equatable, Sendable, Decodable {
     inflight = try? c.decodeIfPresent(SessionInflight.self, forKey: .inflight)
     let rawOpenRequests = (try? c.decodeIfPresent([JSONValue].self, forKey: .openRequests)) ?? nil
     openRequests = (rawOpenRequests ?? []).compactMap { $0.decoded(OpenRequest.self) }
+    let revision = (try? c.decodeIfPresent(Int.self, forKey: .revision)) ?? nil
+    let generation = (try? c.decodeIfPresent(Int.self, forKey: .executionGeneration)) ?? nil
+    fences = SessionFences(revision: revision, generation: generation)
+  }
+}
+
+/// A session-authority host's compare-and-swap fences for `session.mutate` (#157):
+/// `expected_revision` / `expected_generation`. Built only when both are present.
+public struct SessionFences: Equatable, Sendable {
+  public var revision: Int
+  public var generation: Int
+
+  public init(revision: Int, generation: Int) {
+    self.revision = revision
+    self.generation = generation
+  }
+
+  public init?(revision: Int?, generation: Int?) {
+    guard let revision, let generation else { return nil }
+    self.init(revision: revision, generation: generation)
   }
 }
 
@@ -319,6 +388,9 @@ public struct SessionMessage: Equatable, Sendable, Decodable, Identifiable {
   public var displayKind: String?
   /// The row's `display_metadata` object (`display_text`, `task_count`, `model_only`, …), or nil.
   public var displayMetadata: JSONValue?
+  /// The durable stored-row id a canonical session-authority host projects (`row_id`): the
+  /// `through_message_id` boundary of a `session.mutate` branch (#159). Nil on older hosts.
+  public var rowID: Int?
 
   /// The single reasoning string for this message, first-non-empty of the three variants
   /// (`reasoning ?? reasoning_content ?? reasoning_details`), or `nil`.
@@ -342,6 +414,7 @@ public struct SessionMessage: Equatable, Sendable, Decodable, Identifiable {
     case reasoningDetails = "reasoning_details"
     case displayKind = "display_kind"
     case displayMetadata = "display_metadata"
+    case rowID = "row_id"
   }
 
   public init(
@@ -351,8 +424,9 @@ public struct SessionMessage: Equatable, Sendable, Decodable, Identifiable {
     toolName: String? = nil, toolCallID: String? = nil, toolCalls: [ToolCallRef]? = nil,
     reasoning: String? = nil, reasoningContent: String? = nil, reasoningDetails: String? = nil,
     args: JSONValue? = nil, inlineDiff: String? = nil,
-    displayKind: String? = nil, displayMetadata: JSONValue? = nil
+    displayKind: String? = nil, displayMetadata: JSONValue? = nil, rowID: Int? = nil
   ) {
+    self.rowID = rowID
     self.id = id
     self.role = role
     self.content = content
@@ -400,6 +474,7 @@ public struct SessionMessage: Equatable, Sendable, Decodable, Identifiable {
     displayKind = (try? c.decodeIfPresent(String.self, forKey: .displayKind))?.trimmedNonEmpty
     displayMetadata = decodeDisplayMetadata(c, forKey: .displayMetadata)
     inlineDiff = displayMetadata?["tool_result_metadata"]?["inline_diff"]?.stringValue?.nonEmpty
+    rowID = (try? c.decodeIfPresent(Int.self, forKey: .rowID)) ?? nil
   }
 }
 

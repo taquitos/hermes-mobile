@@ -9,28 +9,64 @@ Normative invariants moved out of `CLAUDE.md` (2026-08-14 restructure). The shor
 The list is the desktop's **Inbox style**, always on and the only list UI — there is no
 grouping pref or picker (the workspace/chronological `SessionGroupingMode` was removed; the
 card header names the workspace instead). The Sessions tab, top to bottom: the "Sessions"
-header, a **Pinned** section (pin order), then the **update-date sections**. Cron runs live in
-the **Cron Jobs tab** (below). All of it
+header, the push card and the tips row (`docs/features/onboarding.md`), a **Pinned** section
+(pin order), then the **update-date sections**. Cron jobs and
+their runs live in the **Cron Jobs tab** (below). All of it
 is display-only over the one `sessions` array. The list is a flat `.listStyle(.plain)` with no
 row or section separators, compact section headers (leading title + a hairline to the
 trailing edge, centred on the title; `defaultMinListHeaderHeight` 0, `listSectionSpacing(0)`,
 the header's own top inset as the only gap), and tighter card row insets than the plain
 default.
 
-**The bottom bar** (`.safeAreaInset(edge: .bottom)` — a `.bottomBar` toolbar renders blank in
-the snapshot host) holds a glass `Sessions | Cron Jobs` tab pill on the leading side (icon over
-label; the selected tab on an inner capsule in the accent, slid by `matchedGeometryEffect`;
-the Cron Jobs tab carries the `cronUnreadCount` badge) and the round glass New chat button
-trailing (`GlassBackground`, material fallback below iOS 26). The pill shows only while
-`showsTabBar` holds — cron content exists (`hasCronContent`), the search field is closed, and
-no query is active (search is a Sessions-only mode) — else the bar is just New chat.
-`selectedTab` is in-memory (a launch
-starts on Sessions); views render `effectiveTab`, which falls back to Sessions whenever the pill
-is hidden, so a poll or profile switch that drops every cron row never strands an empty tab.
+**The bottom bar** (`HomeTabBar`, a `.safeAreaInset(edge: .bottom)` — a `.bottomBar` toolbar
+renders blank in the snapshot host) holds a glass tab pill filling the leading space —
+`availableTabs`: Sessions, Cron Jobs only with cron content (`hasCronContent`), then Settings
+(icon over label, equal widths; the selected tab on an inner capsule in the accent, slid by
+`matchedGeometryEffect`; no unread badge on any tab) — and the round glass New session button
+trailing (`GlassBackground`, material fallback below iOS 26), offered on every tab. The pill
+shows while `showsTabBar` holds — the search field is closed and no query is active (search is
+a Sessions-only mode) — else the bar is just New session. `selectedTab` is in-memory (a launch
+starts on Sessions); views render `effectiveTab`, which falls back to Sessions whenever the
+selected tab is unavailable, so a poll or profile switch that drops every cron row never
+strands an empty tab.
 
-**Search is opened from the toolbar** (Sessions tab only): a search button sits beside Archive
-in one trailing `ToolbarItemGroup` (one glass pill on iOS 26). `searchButtonTapped` sets
-`isSearchPresented`, which hides the nav bar row (settings, profile pill, Archive) and shows a
+**The Settings tab** (`docs/features/settings.md`) is its own `NavigationStack`
+(`SettingsView` owns the `SettingsPath` pushes), so `AppView` LAYERS it over the WHOLE
+`NavigationSplitView` — never inside the sidebar column, whose navigation controller would nest
+it (tried: on device the list's bar covered Settings and its root title vanished). On iPad it
+therefore spans the window, like any tab. The split stays mounted underneath (opacity 0, no hit
+testing, `.accessibilityHidden`; the Settings layer also carries the `.isModal` trait, since the
+hidden modifier does not reach the list's UIKit-backed rows — and toggling it on the `List`
+itself broke the tab switch on device) so the list's `.task` poll, its sheets and the live chat are not
+torn down per switch. `selectTab(.settings)` seeds `settings` fresh (the
+old `settingsButtonTapped` seeding); re-tapping keeps it; any other tab, a child `dismiss()`
+(Reconnect, Sign out, "Ask agent") and the disconnect / install delegates all go through
+`closeSettingsTab()` (state dropped → child effects cancelled, tab back to Sessions). While the
+tab is open, a trailing reducer (`syncSettingsSeed()`) mirrors the list-owned seed facts —
+`connection`, `pushAvailable`, `deleteSupported`, the scoped profile — so a long-lived tab
+never shows a stale capability or a deleted profile. `dismissPresentations()` (App Intents)
+deliberately leaves the tab alone: it runs in `AppFeature`, outside the list's `ifLet`, so a
+nil-out there would orphan Settings' effects. Instead `AppFeature` leaves the tab
+(`.home(.selectTab(.sessions))`, an action so the `ifLet` cancels) on every chat route —
+`pushTapped`, `launchIntentReceived` (widgets too), the list's `openSession` / `createSession`
+delegates — in both layouts, since the chat (compact marker or regular seat, even an in-place
+hydrate) would otherwise land hidden under the Settings layer. Under the Settings layer the
+list keeps rendering the Sessions rows (the tab Settings always returns to), so their scroll
+position survives.
+
+**The nav bar**: Archive on the leading side; the profile pill as the centered title (when
+`profilesSupported`); trailing, in one `ToolbarItemGroup` (one glass pill on iOS 26), Search
+(Sessions tab only) and the profile Edit menu. **The pill's menu selects in ONE tap**: every
+profile as a plain button (no checkmarks, Safari-style — a house for the default, a person
+glyph for custom ones; the pill title names the active one), a divider, then Add profile. No
+nested per-profile submenu. **Rename and Delete live in the trailing pencil menu**,
+for the SELECTED profile only, shown while `canEditSelectedProfile` — a known custom profile
+(never the default one, never a selection the profiles list hasn't loaded, never without the
+profiles API). Both route through the existing rename alert and `.bottomActionSheet` delete
+confirmation.
+
+**Search is opened from the toolbar** (Sessions tab only). `searchButtonTapped` sets
+`isSearchPresented`, which hides the nav bar row (Archive, profile pill, Search, Edit) and shows a
 glass capsule field — focused on open — beside a round glass close button in a top
 `safeAreaInset`. `searchCloseTapped` hides it and clears the query, reloading the normal list
 at once when a query was live (the same immediate `load` a cleared query gets through the
@@ -119,10 +155,11 @@ in a fixed-width slot so header text keeps one left edge. Desktop's stalled / ba
 draft states need live events for every session and are not shown. The compact row's unread
 dot keeps the accent.
 
-**The compact `SessionRowView` stays only on dense surfaces**: cron run peeks, the flat cron
-fallback, unmatched cron runs (`cronRunRow(_:)`), and the archived sheet. Cards (`row(_:)`) and
+**The compact `SessionRowView` stays only on dense surfaces**: the flat cron fallback
+(`cronRunRow(_:)`, agents without the jobs API) and the archived sheet. Cards (`row(_:)`) and
 compact rows share one affordance funnel, `sessionRow(_:content:)` — tap, highlight +
-`isSelected` trait, swipes, context menu are identical for both.
+`isSelected` trait, swipes, context menu are identical for both. The run rows under an
+expanded cron job are neither: timestamp-only, tap-only (see below).
 
 **Archived** is a direct top-trailing **"Archived sessions" toolbar button** (`archivebox`;
 the former organize `Menu` — grouping picker, cron toggle, Archived — is gone) presenting a
@@ -139,36 +176,109 @@ keys once, when it is built (no migration — cron runs have their own tab now).
 into the **Cron Jobs tab**. The partition lives in the reducer's computed state
 (`cronSessions` vs the non-cron `interactiveSessions` that feeds
 `pinnedSessions`/`unpinnedSessions` → `chronologicalSessions` → `dateSections`), so cron rows
-never appear in Pinned or the date sections. The tab exists whenever `hasCronContent` holds
-(any cron run OR any fetched job, so a job with no runs in the fetched window stays
-reachable); it renders a "Cron Jobs" title row and the jobs, and is never searched. The "No
-sessions" placeholder follows `showsEmptyPlaceholder`: the Sessions tab with no search hit (or,
-outside search, no interactive session), not loading or failed. An empty non-search list with
-no jobs known holds `isLoading` until the load's cron-jobs response lands (`awaitsCronJobs`),
-so the placeholder and the tab pill appear together; a transient cron failure there settles on
-the placeholder.
+never appear in Pinned or the date sections. The tab exists whenever `hasCronContent` holds:
+with the jobs API, any fetched job (a job with no runs stays reachable; runs alone, incl. a
+deleted job's, never bring the tab back); without it, any cron run (the flat fallback). It
+renders a "Cron Jobs" title row and the jobs, and is never searched. The "No sessions"
+placeholder follows `showsEmptyPlaceholder`: the Sessions tab with no search hit (or, outside
+search, no interactive session), not loading or failed; under the push card or tips row it
+flows as a row (`showsInlineEmptyPlaceholder`, `docs/features/onboarding.md`). A non-search list with no interactive
+session and no jobs known holds `isLoading` until the load's cron-jobs response lands
+(`awaitsCronJobs`), so the placeholder and the Cron Jobs tab appear together; a transient cron
+failure there settles on the placeholder.
 
-**The Cron Jobs tab groups runs under their *jobs*, desktop-style**: `GET /api/cron/jobs` is
-fetched sequentially INSIDE the session-load effect (after `.sessionsResponse`, same CancelID —
-deterministic TestStore order, no racy merge); a run session binds to its job via the
-id-embedded prefix (`cron_{job_id}_{ts}` → `CronJob.jobID(fromSessionID:)`) — upstream has a
-`/runs` endpoint, but the client groups from the already-fetched sessions so **older agents work
-too**. Job rows: state pip (**green live / amber paused** — deliberately NOT the accent, which
-is orange and would be indistinguishable from amber; red error, gray inactive),
-`relativeRunLabel` next-run countdown off `state.now` (poll-refreshed — no per-second ticker),
-unread dot judged over ALL the job's runs (not just the peeked 5), and a context menu (Run now /
-Pause / Resume → `cronActionInFlightIDs` double-fire guard; success refetches — full load after
-trigger, jobs-only for pause/resume; **no optimistic job-state mutation**). Tap = single-open
-inline peek (`expandedCronJobID`) of the newest `cronPeekLimit` runs via the compact
-`cronRunRow(_:)`; runs matching no fetched job render flat below (`unmatchedCronSessions` —
-never hide output).
-The tab carries the aggregate `cronUnreadCount` badge; cron sessions use the same shared
-server-backed unread state as interactive rows (with the legacy device-local `seenCounts`
-fallback below). **Capability-gated**: a 404 flips
-`cronJobsSupported` off → flat run list, fetch skipped thereafter; transient failures keep the
-previous jobs (no flapping). Jobs are fetched with the LITERAL selected profile name when
-`profilesSupported` (matching the scoped session list, so a job's runs are actually present),
-unscoped otherwise.
+**The Cron Jobs tab lists *jobs* only, desktop-style** (`State.sortedCronJobs`: soonest next
+run first, no-next-run last, then title). `GET /api/cron/jobs` is fetched sequentially INSIDE
+the session-load effect (after `.sessionsResponse`, same CancelID — deterministic TestStore
+order, no racy merge), with the LITERAL selected profile name when `profilesSupported`,
+unscoped otherwise. **Capability-gated**: a jobs 404 flips `cronJobsSupported` off → the flat
+run list (`cronSessions` via the compact `cronRunRow(_:)`), fetch skipped thereafter; transient
+failures keep the previous jobs (no flapping). Agents without the jobs API therefore keep the
+flat list exactly as before.
+
+**Never group cron runs by session id.** The old client bound a run session to its job via the
+id-embedded prefix (`cron_{job_id}_{ts}`); upstream hermes-agent `e2042c84` (2026-10-15) moved
+cron onto the unified runtime, whose runs get `local-*` session ids, and `/api/sessions` rows
+carry no `cron_job_id` — so every new run fell out of its job into an "unmatched" pile. The id
+parser, the job↔run grouping, the unmatched list and the per-job unread rollup were removed;
+a job's runs come only from the server's own job↔run join:
+
+- **Runs load per expanded job** from `GET /api/cron/jobs/{id}/runs?limit=5` (`cronPeekLimit`;
+  profile-scoped like the jobs fetch) into ONE slot, `expandedCronRuns` (`nil` = spinner, `[]`
+  = "No runs yet"). The fetch runs on its own `CancelID.cronRuns` with `cancelInFlight`, so a
+  refresh or a job switch supersedes it without touching the list load, and a late response
+  for a job that is no longer expanded is dropped (`cronRunsResponse(jobID:)` guard). Tap is
+  single-open (`expandedCronJobID`); every collapse — re-tap, the jobs-API 404 flip, a profile
+  switch, deleting the expanded job, a jobs refetch that no longer lists it — goes through
+  `collapseExpandedCronJob` (clears id + slot, cancels the fetch), so one job's runs never
+  show under another; `onDisappear` cancels the fetch too.
+- **Refresh**: a `load` (the 10 s poll, pull-to-refresh, the Run now success) refetches the
+  expanded job's runs alongside — never inside — the shared-`fetch` list effect, only while
+  the Cron Jobs tab is on screen (`effectiveTab == .cron`; never on the Sessions tab or while
+  searching); `selectTab(.cron)` refetches them on return.
+- **Failure**: any `/runs` failure, 404 included, is a load failure — "Couldn't load runs" on
+  the FIRST load only (a failed refresh keeps the runs on screen; the next poll retries). It
+  flips NO capability: upstream ships `/runs` with the jobs API, and a 404 there can also mean
+  the job is gone.
+- **Run rows are timestamp-only** (sibling runs share the job's title): `CronJob.runTimestampLabel`
+  over `updatedAt ?? startedAt` (desktop `last_active || started_at`), "Jun 10, 07:00",
+  a `Date.VerbatimFormatStyle` with a POSIX locale in the list calendar's time zone, so
+  snapshots are locale-deterministic. A session run (`isCron`) is tap-only — no swipe or
+  context menu — and `cronRunTapped` looks it up in `expandedCronRuns`, NOT `state.sessions`
+  (an older run may sit outside the list's 50-row cron slice), then opens it. A script-only
+  `cron_output` row (synthetic `cron_output:…` id, no backing session) is plain secondary text —
+  never a tap; `/runs` rows that don't decode (incl. a row with no `id`) are dropped, not fatal.
+
+**Job rows**: a state pip (**green live / amber paused** — deliberately NOT the accent, which is
+orange and would be indistinguishable from amber; red error, gray inactive), the title, and a
+status caption from `CronJob.statusCaption(now:)` off `state.now` (poll-refreshed — no
+per-second ticker). Inactive states (`paused` / `error` / `completed` / `disabled`, incl.
+`enabled == false`) show their word, so a paused job never reads "Next in 1 hr."; an active job
+shows "Next …", or an orange "Overdue · … ago" once `next_run_at` is more than
+`CronJob.overdueGrace` (15 min, hermes-agent `_OVERDUE_GRACE_SECONDS` / desktop
+`NEXT_RUN_OVERDUE_GRACE_MS`; strictly greater, so the boundary stays "Next") in the past — a
+parked past slot is the only visible trace of a dead scheduler; with no next run the schedule
+stands in. The caption is part of the row's accessibility label, so the state word is
+announced.
+
+**Job actions** (context menu): Run now / Pause / Resume / Delete, all through
+`performCronAction` (`cronActionInFlightIDs` double-fire guard; **no optimistic job-state
+mutation**). Success reconciles by kind (`CronJobActionKind`): Run now → full `load` (sessions +
+jobs + the expanded job's runs, so the new run appears); pause/resume → jobs-only refetch.
+**Delete** raises a `ConfirmationDialogState` (title names the job; presented via
+`.bottomActionSheet`) and is NOT optimistic: the row stays until `DELETE /api/cron/jobs/{id}`
+returns. A confirm that hits the in-flight guard is never dropped silently: it banners
+`cronJobBusyMessage`. Success — or a **404, read as already gone** — drops the job locally
+(collapsing it if expanded), then `cancelOrRestartFetch`: a pending list load or an active
+search is restarted (so a pre-DELETE jobs response can't bring the row back; the restarted
+load refetches the jobs, a search load skips them until its clear reloads), otherwise the
+in-flight fetch is cancelled and a jobs-only refetch runs. Any other failure banners the
+server's copy. The job's past runs stay on the server but are no longer listed in the tab.
+
+**No cron unread tracking**: no tab badge, no job-row dot (desktop parity). A run row still
+shows the shared unread dot when that run is in the list's cron slice and unread
+(`unreadSessionIDs`); the flat fallback keeps the regular row dot.
+
+## Shared pin membership, local order
+
+**Pin membership syncs with the server; pin order stays device-local.**
+
+- Server sync requires `profilesSupported` and pin capability discovered from a list response.
+  Otherwise pins stay local-only. Writes use the selected literal profile, including `"default"`.
+  After discovery, search rows support Pin/Unpin even without a `pinned` field; search responses
+  never reconcile membership or initiate migration.
+- Explicit list membership is authoritative except for pending writes and legacy migration.
+  Nil fields and absent rows preserve cached membership; local ordering is never server-owned.
+- Legacy pins remain pending per server across pages, profiles, failed uploads, and normal
+  relaunches until acknowledged or observed pinned. Failed uploads retry silently on a later
+  capable list; retired pins follow server membership. Logout clears migration state.
+  Only ids still pinned locally are uploaded: a pin change made while server writes are off
+  (e.g. a failed profiles probe) stays local, and the next capable list decides membership.
+- Pin writes are single-flight per ID. Failure restores only that ID at its bounded prior index
+  and shows an error that survives the completion-triggered refetch. Stale pre-write fetches
+  cannot overwrite completed writes; profile switches clear old rows.
+- Pin and archive/delete do not exclude each other, including archived-sheet deletes.
+  Confirmed removal prevents a later pin failure from restoring removed membership.
 
 ## Shared unread state
 
@@ -231,9 +341,11 @@ fetch restarts instead and lands an authoritative post-RPC response. A **cleared
 (trimmed-empty `searchQuery` binding) reloads immediately via `load` rather than the 300ms
 search debounce — `load` raises `isLoading`, which is what keeps that pending reload visible
 to `cancelOrRestartFetch` (the debounced search effect raises no flag, and with the query
-empty `isSearching` no longer covers the window). Delete is offered on every row variant
-(pinned, cron runs, branch children) — cards and compact rows alike funnel through the one
-`sessionRow(_:content:)` builder.
+empty `isSearching` no longer covers the window). Delete is offered on every session row
+variant (pinned, flat-fallback cron runs, branch children) — cards and compact rows alike
+funnel through the one `sessionRow(_:content:)` builder. The run rows under an expanded cron
+job are tap-only (no swipe or context menu, as on the desktop); deleting a cron *job* is its
+own flow (see "Cron sessions & the Cron Jobs tab").
 
 **Capability gate — the 405 wrinkle**: `deleteSupported` defaults `true` and flips off lazily
 on a definitive verdict from an actual delete (no pre-probe). The verdict is `.notFound` **or**

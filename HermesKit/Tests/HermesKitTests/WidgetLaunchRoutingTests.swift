@@ -223,9 +223,9 @@ struct WidgetLaunchRoutingTests {
   /// The open can arrive over a list sheet: presentations are dismissed first, like the #93
   /// new-chat intents.
   @Test func openSessionDismissesListPresentations() async {
-    var home = SessionListFeature.State(connection: connection)
+    var home = SessionListFeature.State(connection: connection, selectedTab: .settings)
     home.settings = SettingsFeature.State(connection: connection)
-    home.showPushSetupSheet = true
+    home.renamingID = "s1"
     let store = TestStore(initialState: AppFeature.State(home: home)) {
       AppFeature()
     } withDependencies: {
@@ -234,11 +234,14 @@ struct WidgetLaunchRoutingTests {
     store.exhaustivity = .off
 
     await store.send(.launchIntentReceived(.openSession(id: "s1", profile: nil))) {
-      $0.home?.settings = nil
-      $0.home?.showPushSetupSheet = false
+      $0.home?.renamingID = nil
     }
     await store.receive(\.home.delegate.openSession)
     #expect(store.state.liveChat?.storedSessionID == "s1")
+    // The Settings tab is left by the path rule once the chat's marker lands.
+    await store.receive(\.home.selectTab, .sessions)
+    #expect(store.state.home?.settings == nil)
+    #expect(store.state.home?.effectiveTab == .sessions)
   }
 
   /// A row from ANOTHER profile than the list shows resumes under that profile, without
@@ -417,8 +420,18 @@ struct WidgetLaunchRoutingTests {
 
   /// A manual login (onboarding fallback) can land minutes or hours after the tap, so a
   /// stashed camera / photos intent replays as a plain new chat — no picker pops up unasked.
-  @Test(arguments: [LaunchIntent.newChatWithCamera, .newChatWithPhotos])
-  func preHomeCameraAndPhotosIntentsDropTheActionOnManualLogin(intent: LaunchIntent) async {
+  ///
+  /// Two tests, not one parameterized: the onboarding landing mints a stack id, and every
+  /// case of a parameterized test shares one cached stack-ID generator.
+  @Test func preHomeCameraIntentDropsTheActionOnManualLogin() async {
+    await assertIntentDropsTheActionOnManualLogin(.newChatWithCamera)
+  }
+
+  @Test func preHomePhotosIntentDropsTheActionOnManualLogin() async {
+    await assertIntentDropsTheActionOnManualLogin(.newChatWithPhotos)
+  }
+
+  private func assertIntentDropsTheActionOnManualLogin(_ intent: LaunchIntent) async {
     let store = TestStore(initialState: AppFeature.State(autoConnecting: true)) {
       AppFeature()
     }
@@ -429,8 +442,8 @@ struct WidgetLaunchRoutingTests {
     await store.send(.autoConnectFailed(connection, .unauthorized)) {
       $0.autoConnecting = false
       $0.onboarding = ConnectionFeature.State(
-        serverURL: self.connection.baseURL.absoluteString,
-        token: self.connection.auth.token ?? ""
+        recovering: self.connection.baseURL,
+        token: self.connection.auth.token
       )
     }
     await store.send(.onboarding(.delegate(.connected(connection)))) {

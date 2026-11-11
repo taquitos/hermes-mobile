@@ -99,6 +99,25 @@ import Testing
     #expect(draft.answer(for: pickOne) == .choices(["UIKit"]))
   }
 
+  @Test func unskippingRestoresPicksAndOtherText() {
+    // The card disables a skipped question's inputs; toggling Skip off must bring back
+    // exactly what was there.
+    var draft = ClarifyDraft()
+    draft.toggle("iOS", in: pickMany)
+    draft.toggle("visionOS", in: pickMany)
+    draft.toggleSkip(pickMany)
+    #expect(draft.isPicked("iOS", in: pickMany), "the picks stay visible under the skip")
+    #expect(draft.answer(for: pickMany) == .skipped)
+    draft.toggleSkip(pickMany)
+    #expect(draft.answer(for: pickMany) == .choices(["iOS", "visionOS"]))
+
+    draft.setText("Flutter", for: pickOne)
+    draft.toggleSkip(pickOne)
+    #expect(draft.text(for: pickOne) == "Flutter")
+    draft.toggleSkip(pickOne)
+    #expect(draft.answer(for: pickOne) == .other("Flutter"))
+  }
+
   @Test func blankTextKeepsTheSkip() {
     var draft = ClarifyDraft()
     draft.toggleSkip(freeText)
@@ -179,6 +198,41 @@ import Testing
     #expect(draft.answers(for: request) == ["q2": .other("app")])
   }
 
+  @Test func progressCountsSettledQuestionsAndReadsNOfNExactlyWhenComplete() {
+    var draft = ClarifyDraft()
+    #expect(draft.progressText(for: batch) == "0 of 3 answered")
+    draft.toggle("UIKit", in: pickOne)
+    #expect(draft.progressText(for: batch) == "1 of 3 answered")
+    draft.toggleSkip(freeText)
+    #expect(draft.progressText(for: batch) == "2 of 3 answered", "a skip settles a question")
+    #expect(!draft.isComplete(for: batch))
+    draft.toggle("iOS", in: pickMany)
+    #expect(draft.progressText(for: batch) == "3 of 3 answered")
+    #expect(draft.isComplete(for: batch))
+    draft.toggle("iOS", in: pickMany)
+    #expect(draft.progressText(for: batch) == "2 of 3 answered", "un-picking unsettles it again")
+  }
+
+  @Test func progressCountsLocksAndBlankTextIsNotAnAnswer() {
+    var request = batch
+    request.lockedAnswers = ["q1": String?.none]
+    var draft = ClarifyDraft()
+    #expect(draft.progressText(for: request) == "1 of 3 answered")
+    draft.setText("  ", for: freeText)
+    #expect(draft.progressText(for: request) == "1 of 3 answered")
+    #expect(draft.isSettled(pickMany, in: request))
+    #expect(!draft.isSettled(freeText, in: request))
+  }
+
+  @Test func aOneQuestionCardHasNoProgressCaption() {
+    let single = ClarifyRequest(requestID: nil, questions: [pickMany], answerShape: .answers)
+    var draft = ClarifyDraft()
+    draft.toggle("iOS", in: pickMany)
+    #expect(draft.progressText(for: single) == nil)
+    let legacy = ClarifyRequest(requestID: "r1", question: "Proceed?", choices: ["Yes", "No"])
+    #expect(ClarifyDraft().progressText(for: legacy) == nil)
+  }
+
   @Test func singleFormsKeyTheirAnswerOnTheEmptyKey() {
     let single = ClarifyRequest(requestID: nil, question: "Proceed?", choices: ["Yes", "No"])
     let question = single.questions[0]
@@ -204,6 +258,24 @@ import Testing
     // The nil-qid single form can never be locked.
     let single = ClarifyRequest(requestID: nil, question: "Proceed?")
     #expect(!single.isLocked(single.questions[0]))
+  }
+
+  // MARK: - Echo
+
+  @Test(arguments: [
+    ("What type of site?", "What type of site? php"),
+    ("Pick one:", "Pick one: php"),
+    ("Describe the site.", "Describe the site. php"),
+    ("Ready!", "Ready! php"),
+    ("Wait…", "Wait… php"),
+    ("どのサイト？", "どのサイト？ php"),
+    ("  Name?  ", "Name? php"),
+    ("Name", "Name: php"),
+    ("Which (optional)", "Which (optional): php"),
+    ("Use \"strict\"", "Use \"strict\": php"),
+  ])
+  func echoLineAddsAColonOnlyWithoutTerminalPunctuation(question: String, line: String) {
+    #expect(ClarifyQuestion(qid: "q0", question: question).echoLine(answer: "php") == line)
   }
 
   @Test func aLockedMultiSelectThatIsNotAnArrayShowsAsSent() {

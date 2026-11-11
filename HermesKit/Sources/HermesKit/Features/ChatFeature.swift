@@ -3168,10 +3168,10 @@ public struct ChatFeature {
       case .confirmationDialog:
         return .none
 
-      case .archiveFailed:
+      case let .archiveFailed(_, error):
         // The chat stays open; the user can retry. Same copy as the list.
         state.removingSessionID = nil
-        state.errorBanner = "Couldn’t archive the session."
+        state.errorBanner = error.sessionMutationBanner("Couldn’t archive the session.")
         return .none
 
       case let .deleteFailed(_, error):
@@ -3182,7 +3182,7 @@ public struct ChatFeature {
           state.deleteSupported = false
           return .none
         }
-        state.errorBanner = "Couldn’t delete the session."
+        state.errorBanner = error.sessionMutationBanner("Couldn’t delete the session.")
         return .none
       }
     }
@@ -3756,6 +3756,54 @@ public struct ChatFeature {
     return plan
   }
 
+  /// How much earlier than `inflight.started_at` the running turn's own prompt row may be
+  /// stamped. `prompt.submit` writes the row just AFTER the turn starts, but a server-side
+  /// queue re-writes a drained prompt's row just BEFORE it dispatches the turn.
+  private static let promptRowStartSlack: TimeInterval = 5
+
+  /// The index in `messages` of the running turn's prompt when the history already carries it
+  /// (#150), else `nil` — the hydrate then seeds `inflight.user` as before. Desktop
+  /// `persisted-live-turn.ts` `locateTurn`: walk back from the end over what a running turn
+  /// persists after its prompt (tool rows, the tool rounds' assistant commentary, its steers,
+  /// unpainted rows); a final reply ends the search, because the rows before it belong to a
+  /// finished turn — so an identical prompt the user sent last turn never hides this one. The
+  /// first other user (or notice) row decides: it is the prompt when it is the same kind of
+  /// row with the same whitespace-collapsed text, and is not stamped before the turn started.
+  private static func persistedPromptIndex(
+    in messages: [SessionMessage], inflight: SessionInflight
+  ) -> Int? {
+    guard let prompt = inflight.user.map(normalizedText), !prompt.isEmpty else { return nil }
+    let isNotice = SessionMessage(
+      id: 0, role: "user", text: inflight.user, displayKind: inflight.displayKind
+    ).isTimelineNotice
+    let started = inflight.startedAt.map(\.timeIntervalSince1970)
+    // The cooked history has no `tool_calls`: a tool round's assistant row is the one a tool
+    // row follows.
+    var followedByTool = false
+    for index in messages.indices.reversed() {
+      let message = messages[index]
+      if message.role == "tool" {
+        followedByTool = true
+        continue
+      }
+      if !message.isPainted || message.displayKind == "steer" { continue }
+      if message.role == "assistant", !message.isTimelineNotice {
+        if followedByTool { continue }
+        return nil // a final reply: this turn's prompt is not in the history
+      }
+      guard message.role == "user" || message.isTimelineNotice else { continue }
+      guard message.isTimelineNotice == isNotice,
+            !isNotice || message.displayKind == inflight.displayKind,
+            normalizedText(message.displayText ?? "") == prompt
+      else { return nil }
+      if let started, let at = message.timestamp, at > 0, at < started - promptRowStartSlack {
+        return nil // an earlier turn's identical prompt
+      }
+      return index
+    }
+    return nil
+  }
+
   /// The assistant `.message` texts of the CURRENT turn (rows after the last user row).
   private static func turnAssistantTexts(in transcript: IdentifiedArrayOf<ChatRow>) -> [String] {
     var texts: [String] = []
@@ -4049,7 +4097,9 @@ public struct ChatFeature {
   }
 
   /// The transcript echo for a clarify answer: the answer itself for one question, one
-  /// `question: answer` line per question for several (locks included), "Skipped" for a skip.
+  /// `question: answer` line per question for several (locks included; no colon after a question
+  /// that already ends in `?`, `:`, `.` and the like — `ClarifyQuestion.echoLine`), "Skipped" for
+  /// a skip.
   static func clarifyEchoText(_ request: ClarifyRequest, _ answers: [String: ClarifyAnswer]?) -> String {
     guard let answers else { return "Skipped" }
     func display(_ question: ClarifyQuestion) -> String {
@@ -4057,7 +4107,7 @@ public struct ChatFeature {
         ?? (answers[question.answerKey] ?? .skipped).displayText
     }
     guard request.isMultiQuestion else { return request.questions.first.map(display) ?? "" }
-    return request.questions.map { "\($0.question): \(display($0))" }.joined(separator: "\n")
+    return request.questions.map { $0.echoLine(answer: display($0)) }.joined(separator: "\n")
   }
 
   /// The shared `.foreground` / `.reattached` re-attach policy: the app returned to the
@@ -4942,6 +4992,18 @@ public struct ChatFeature {
       )
       if !inflightNotice.isPainted {
         // Nothing to seed for the prompt.
+      } else if let index = Self.persistedPromptIndex(in: response.messages, inflight: inflight) {
+        // #150: the history already carries this turn's prompt (the gateway writes it at
+        // submit, and mid-turn flushes add the turn's tool rounds after it). Seeding it again
+        // would paint a second identical bubble, so the persisted row stands in for the seed.
+        // Lacking a server stamp, it gets the seed's, so the finished turn's header still
+        // knows when the turn started.
+        let message = response.messages[index]
+        if message.timestamp.map({ $0 <= 0 }) ?? true,
+           let started = inflight.startedAt ?? anchorKey(state).flatMap({ chatSnapshot.turnAnchor($0) }),
+           let id = reconstructTranscript(Array(response.messages[...index])).last?.id {
+          state.transcript[id: id]?.timestamp = started
+        }
       } else if inflightNotice.isTimelineNotice {
         let noticeKind = ChatRow.Kind.status(
           kind: ChatRow.Kind.noticeStatusKind, text: timelineNoticeText(inflightNotice)

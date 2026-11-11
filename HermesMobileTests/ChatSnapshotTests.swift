@@ -709,7 +709,8 @@ final class ChatSnapshotTests: SnapshotTestCase {
   }
 
   /// A three-question batch (single-select, multi-select, free text): one section per question,
-  /// each with its own Skip, Confirm disabled until every question has an answer or a skip.
+  /// each with its own Skip, Confirm disabled until every question has an answer or a skip, and
+  /// the "0 of 3 answered" caption on the title line (#169).
   func testClarifyCard_multiQuestion() {
     let view = ClarifyCardView(
       request: Self.batchClarify(),
@@ -718,6 +719,42 @@ final class ChatSnapshotTests: SnapshotTestCase {
     )
     .frame(width: device.size?.width ?? 390, height: 520)
     .background(Color(uiColor: .systemBackground))
+    assertSnapshot(of: view, as: componentImage())
+  }
+
+  /// #169: the first question answered, the next below the fold of a short region. The title
+  /// line's "1 of 3 answered" caption is what says why Confirm is still disabled.
+  func testClarifyCard_multiQuestionPartlyAnswered() {
+    let request = Self.batchClarify()
+    var draft = ClarifyDraft()
+    draft.toggle("UIKit", in: request.questions[0])
+    let view = ClarifyCardView(request: request, draft: draft, onSubmit: { _ in }, onSkip: {})
+      .frame(width: device.size?.width ?? 390, height: 300)
+      .background(Color(uiColor: .systemBackground))
+    assertSnapshot(of: view, as: componentImage())
+  }
+
+  /// Skipped questions dim and disable their inputs: the typed name and the picked target stay
+  /// under the skip (un-skipping restores them) but no longer read as unfilled while the
+  /// caption already counts them ("2 of 2 answered"). Two questions, so both skipped sections
+  /// fit the region.
+  func testClarifyCard_multiQuestionSkipped() {
+    let request = ClarifyRequest(
+      requestID: nil,
+      questions: [
+        ClarifyQuestion(qid: "q0", question: "What should the app be called?"),
+        ClarifyQuestion(qid: "q1", question: "Targets?", choices: ["iOS", "macOS"], multiSelect: true),
+      ],
+      answerShape: .answers
+    )
+    var draft = ClarifyDraft()
+    draft.setText("Atlas", for: request.questions[0])
+    draft.toggleSkip(request.questions[0])
+    draft.toggle("iOS", in: request.questions[1])
+    draft.toggleSkip(request.questions[1])
+    let view = ClarifyCardView(request: request, draft: draft, onSubmit: { _ in }, onSkip: {})
+      .frame(width: device.size?.width ?? 390, height: 520)
+      .background(Color(uiColor: .systemBackground))
     assertSnapshot(of: view, as: componentImage())
   }
 

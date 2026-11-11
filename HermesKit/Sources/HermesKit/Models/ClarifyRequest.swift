@@ -23,6 +23,24 @@ public struct ClarifyQuestion: Equatable, Sendable {
   /// or `""` for the `nil`-qid question of the intermediate and legacy single forms.
   public var answerKey: String { qid ?? "" }
 
+  /// This question's line in the multi-question transcript echo: `"Name: Atlas"`, but
+  /// `"What type of site? php"` when the question already ends in terminal punctuation — a
+  /// colon after it read as `"site?: php"`.
+  func echoLine(answer: String) -> String {
+    let label = question.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let last = label.last, Self.echoTerminators.contains(last) {
+      return "\(label) \(answer)"
+    }
+    return "\(label): \(answer)"
+  }
+
+  /// Punctuation a question can end in that already separates it from its answer (ASCII and
+  /// the full-width forms). Closing brackets and quotes are deliberately absent: `Which (optional)`
+  /// still reads best with the colon.
+  private static let echoTerminators: Set<Character> = [
+    "?", ":", ".", "!", ";", "…", "？", "：", "。", "！", "；",
+  ]
+
   public init(qid: String? = nil, question: String, choices: [String] = [], multiSelect: Bool = false) {
     self.qid = qid
     self.question = question
@@ -356,9 +374,24 @@ public struct ClarifyDraft: Equatable, Sendable {
     return answers
   }
 
-  /// Can the form be submitted? Every question is locked, answered or skipped.
+  /// Is this question settled: locked, answered or skipped?
+  public func isSettled(_ question: ClarifyQuestion, in request: ClarifyRequest) -> Bool {
+    request.isLocked(question) || answer(for: question) != nil
+  }
+
+  /// Can the form be submitted? Every question is settled.
   public func isComplete(for request: ClarifyRequest) -> Bool {
-    request.questions.allSatisfy { request.isLocked($0) || answer(for: $0) != nil }
+    request.questions.allSatisfy { isSettled($0, in: request) }
+  }
+
+  /// The multi-question card's progress caption, "1 of 2 answered" (the desktop's copy), or
+  /// `nil` for a one-question card. It counts what ``isComplete(for:)`` counts (a skip or a lock
+  /// is settled too), so it reads "N of N" exactly when Confirm enables. Without it, a question
+  /// below the fold of the card's scroll region left Confirm looking broken (#169).
+  public func progressText(for request: ClarifyRequest) -> String? {
+    guard request.isMultiQuestion else { return nil }
+    let settled = request.questions.filter { isSettled($0, in: request) }.count
+    return "\(settled) of \(request.questions.count) answered"
   }
 
   /// Does Return in the "Other" row submit the card? Only where a single answer is all the

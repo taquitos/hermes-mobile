@@ -17,7 +17,7 @@ let developmentTeam = Environment.developmentTeam.getString(default: "")
 // validation rejects an embedded extension whose CFBundleVersion differs) — bump the build
 // number here, once, for both targets.
 let marketingVersion: SettingValue = "1.0"
-let currentProjectVersion: SettingValue = "93"
+let currentProjectVersion: SettingValue = "96"
 
 let appBundleIdentifier = "com.taquitos.HermesMobile"
 
